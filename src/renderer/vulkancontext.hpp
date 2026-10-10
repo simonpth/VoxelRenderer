@@ -27,10 +27,12 @@
 #include <string>
 #include <vector>
 #include <span>
+#include <unordered_map>
 
 #include "window.hpp"
 #include "ui.hpp"
 #include "../simulation/state.hpp"
+#include "../simulation/svo.hpp"
 
 #ifndef VOXEL_SHADER_DIR
 #define VOXEL_SHADER_DIR "shaders/"
@@ -38,6 +40,7 @@
 
 class VulkanContext {
 public:
+    static constexpr std::size_t kMaxGpuSvoBytes = voxel::kMaxSvoBytes;
     explicit VulkanContext(Window* window);
     ~VulkanContext();
 
@@ -45,7 +48,7 @@ public:
     VulkanContext& operator=(const VulkanContext&) = delete;
 
     // Call once per frame. Renders everything and presents.
-    void drawFrame(float deltaTime, float totalTime, const voxel::RenderState& state);
+    void drawFrame(float deltaTime, float totalTime, voxel::RenderState& state);
 
     // Call from resize event.
     void notifyResized() { m_framebufferResized = true; }
@@ -68,15 +71,17 @@ private:
         float    deltaTime = 0.0f;
         glm::vec4 playerPosition{0.0f};
         glm::vec4 viewDirection{0.0f, 0.0f, -1.0f, 0.0f};
-        uint32_t worldSize = voxel::kWorldEdge;
+        uint32_t worldSize = voxel::kWorldWidth;
+        uint32_t worldDepth = voxel::kWorldDepth;
+        uint32_t maxRayDistance = 256;
+        float lodPixelThreshold = 1.5f;
     };
 
     struct FrameData {
         VkCommandPool   pool                    = VK_NULL_HANDLE;
         VkCommandBuffer cmd                     = VK_NULL_HANDLE;
         VkSemaphore     imageAvailable          = VK_NULL_HANDLE;
-        VkSemaphore     renderFinished          = VK_NULL_HANDLE;
-        VkFence         inFlight                = VK_NULL_HANDLE;
+        VkFence          inFlight                = VK_NULL_HANDLE;
         VkImage         computeImage            = VK_NULL_HANDLE;
         VmaAllocation   computeAllocation       = VK_NULL_HANDLE;
         VkImageView     computeImageView        = VK_NULL_HANDLE;
@@ -136,6 +141,7 @@ private:
     // Swapchain-dependent
     std::vector<VkImage>     m_swapchainImages;
     std::vector<VkImageView> m_swapchainImageViews;
+    std::vector<VkSemaphore> m_renderFinishedSemaphores;
     std::vector<VkFence>     m_imagesInFlight; // fence currently using each image
 
     // Per-frame
@@ -154,8 +160,19 @@ private:
     VkBuffer m_worldBuffer = VK_NULL_HANDLE;
     VmaAllocation m_worldAllocation = VK_NULL_HANDLE;
     void* m_worldMappedData = nullptr;
-    std::array<std::uint32_t, voxel::kVoxelCount * 2> m_uploadedWorld{};
+    std::vector<std::uint32_t> m_uploadedWorld;
+    std::size_t m_worldBufferCapacity = 0;
     bool m_worldUploaded = false;
+    struct RegionKeyHash {
+        std::size_t operator()(const voxel::RegionCoord& coordinate) const noexcept {
+            return (static_cast<std::size_t>(coordinate.x) << 32) ^
+                   (static_cast<std::size_t>(coordinate.y) << 16) ^
+                   coordinate.z;
+        }
+    };
+    std::unordered_map<voxel::RegionCoord, std::uint32_t, RegionKeyHash> m_gpuRevisions;
+    std::unordered_map<voxel::RegionCoord, std::uint32_t, RegionKeyHash> m_gpuNodeCounts;
+    std::unordered_map<voxel::RegionCoord, std::vector<std::uint32_t>, RegionKeyHash> m_gpuNodes;
 
     UI m_ui;
     float m_rollingFps = 60.0f;

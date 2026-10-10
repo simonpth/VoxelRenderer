@@ -15,12 +15,19 @@ float wrapDegrees(float value) {
     while (value < -180.0f) value += 360.0f;
     return value;
 }
+
 }
 
-Authority::Authority(std::uint32_t playerId) {
+Authority::Authority(std::uint32_t playerId, std::shared_ptr<SvoWorld> world)
+    : m_svoWorld(std::move(world)) {
+    if (!m_svoWorld) m_svoWorld = std::make_shared<SvoWorld>();
     m_state.localPlayer.id = playerId;
     m_state.world = makeTerrain();
-    m_state.localPlayer.position = {16.0f, 16.0f, 12.0f};
+    // The dense world remains a temporary snapshot compatibility field. New
+    // collision queries use the region-partitioned SVO below.
+    // The generated height map is centered around z=64 with a maximum below
+    // 96, so the initial feet position starts safely above terrain.
+    m_state.localPlayer.position = {16.0f, 16.0f, 96.0f};
     m_state.localPlayer.grounded = false;
     m_state.playerCount = 1;
     m_state.players[0] = m_state.localPlayer;
@@ -53,16 +60,14 @@ void Authority::step(const InputIntent& intent, float seconds) {
 void Authority::movePlayer(float seconds) {
     auto& player = m_state.localPlayer;
     player.position += player.velocity * seconds;
-    player.position.x = std::clamp(player.position.x, kPlayerRadius,
-                                   static_cast<float>(kWorldEdge) - kPlayerRadius);
-    player.position.y = std::clamp(player.position.y, kPlayerRadius,
-                                   static_cast<float>(kWorldEdge) - kPlayerRadius);
+    player.position.x = std::clamp(
+        player.position.x, kPlayerRadius,
+        static_cast<float>(kWorldWidth) - kPlayerRadius);
+    player.position.y = std::clamp(
+        player.position.y, kPlayerRadius,
+        static_cast<float>(kWorldWidth) - kPlayerRadius);
     const auto solid = [&](int x, int y, int z) {
-        if (x < 0 || y < 0 || z < 0 || x >= static_cast<int>(kWorldEdge) ||
-            y >= static_cast<int>(kWorldEdge) || z >= static_cast<int>(kWorldEdge)) return true;
-        return m_state.world[static_cast<std::size_t>(x) +
-                             kWorldEdge * (static_cast<std::size_t>(y) +
-                             kWorldEdge * static_cast<std::size_t>(z))].material != 0;
+        return m_svoWorld->isSolid(x, y, z);
     };
     const auto collides = [&](glm::vec3 position) {
         const int minX = static_cast<int>(std::floor(position.x - kPlayerRadius));

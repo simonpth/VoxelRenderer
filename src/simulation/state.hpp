@@ -55,7 +55,7 @@ struct InputIntent {
 
 struct PlayerState {
     std::uint32_t id = 0;
-    glm::vec3 position{16.0f, 16.0f, 8.0f};
+    glm::vec3 position{16.0f, 16.0f, 96.0f};
     glm::vec3 velocity{0.0f};
     float yaw = -90.0f;
     float pitch = 0.0f;
@@ -77,6 +77,18 @@ struct RenderState {
     std::uint32_t worldRevision = 0;
     PlayerState localPlayer{};
     VoxelWorld world = makeEmptyWorld();
+    struct Region {
+        std::uint16_t x = 0;
+        std::uint16_t y = 0;
+        std::uint16_t z = 0;
+        std::uint8_t depth = 0;
+        std::uint32_t revision = 0;
+        // Transient upload payload. The client clears it after the renderer
+        // consumes this update; persistent SVO storage belongs on the GPU.
+        std::vector<std::uint32_t> packedNodes;
+        bool remove = false;
+    };
+    std::vector<Region> regions;
 };
 
 struct VoxelChange {

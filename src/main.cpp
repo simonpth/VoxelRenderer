@@ -70,7 +70,7 @@ int main() {
         input.jumpPressed = jumpDown;
         client.submit(input, deltaTime);
         client.updateRender(deltaTime);
-        const voxel::RenderState& renderState = client.renderState();
+        voxel::RenderState& renderState = client.renderState();
         renderer.drawFrame(deltaTime, totalTime, renderState);
     }
 

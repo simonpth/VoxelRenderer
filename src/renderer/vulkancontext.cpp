@@ -86,8 +86,6 @@ VulkanContext::~VulkanContext() {
   for (auto &frame : m_frames) {
     if (frame.imageAvailable)
       vkDestroySemaphore(m_device, frame.imageAvailable, nullptr);
-    if (frame.renderFinished)
-      vkDestroySemaphore(m_device, frame.renderFinished, nullptr);
     if (frame.inFlight)
       vkDestroyFence(m_device, frame.inFlight, nullptr);
     if (frame.pool)
@@ -188,6 +186,12 @@ void VulkanContext::createSwapchain() {
   m_swapchainImages = unwrap(m_swapchain.get_images(), "get swapchain images");
   m_swapchainImageViews = unwrap(m_swapchain.get_image_views(), "get swapchain image views");
   m_imagesInFlight.assign(m_swapchainImages.size(), VK_NULL_HANDLE);
+  m_renderFinishedSemaphores.resize(m_swapchainImages.size(), VK_NULL_HANDLE);
+  VkSemaphoreCreateInfo semaphoreInfo{};
+  semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+  for (auto& semaphore : m_renderFinishedSemaphores)
+    checkVk(vkCreateSemaphore(m_device, &semaphoreInfo, nullptr, &semaphore),
+            "create render-finished semaphore");
 }
 
 void VulkanContext::createFrameResources() {
@@ -208,7 +212,6 @@ void VulkanContext::createFrameResources() {
     VkSemaphoreCreateInfo semaphoreInfo{};
     semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
     checkVk(vkCreateSemaphore(m_device, &semaphoreInfo, nullptr, &frame.imageAvailable), "create imageAvailable semaphore");
-    checkVk(vkCreateSemaphore(m_device, &semaphoreInfo, nullptr, &frame.renderFinished), "create renderFinished semaphore");
 
     VkFenceCreateInfo fenceInfo{};
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
@@ -404,9 +407,12 @@ void VulkanContext::createDescriptorPool() {
 }
 
 void VulkanContext::createWorldBuffer() {
+    constexpr std::size_t kGpuWorldBufferBytes =
+        std::min<std::size_t>(64u * 1024u * 1024u, kMaxGpuSvoBytes);
+    m_worldBufferCapacity = kGpuWorldBufferBytes;
     VkBufferCreateInfo bufferInfo{};
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferInfo.size = sizeof(m_uploadedWorld);
+    bufferInfo.size = m_worldBufferCapacity;
     bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
@@ -421,7 +427,8 @@ void VulkanContext::createWorldBuffer() {
     m_worldMappedData = allocation.pMappedData;
 
     for (auto& frame : m_frames) {
-      VkDescriptorBufferInfo worldInfo{m_worldBuffer, 0, sizeof(m_uploadedWorld)};
+      VkDescriptorBufferInfo worldInfo{
+          m_worldBuffer, 0, static_cast<VkDeviceSize>(m_worldBufferCapacity)};
       VkWriteDescriptorSet write{};
       write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
       write.dstSet = frame.computeDescriptorSet;
@@ -443,21 +450,81 @@ void VulkanContext::destroyWorldBuffer() {
   }
 
 void VulkanContext::uploadWorld(const voxel::RenderState& state) {
-    std::array<std::uint32_t, voxel::kVoxelCount * 2> packed{};
-    for (std::size_t i = 0; i < voxel::kVoxelCount; ++i) {
-      const auto& voxel = state.world[i];
-      packed[i * 2] = voxel.material;
-      packed[i * 2 + 1] = static_cast<std::uint32_t>(voxel.color.r) |
-                          (static_cast<std::uint32_t>(voxel.color.g) << 8u) |
-                          (static_cast<std::uint32_t>(voxel.color.b) << 16u) |
-                          (static_cast<std::uint32_t>(voxel.color.a) << 24u);
+    constexpr std::size_t kHeaderWords = 8;
+    // The world has 8192 addressable regions, but a client only keeps its
+    // current streaming window resident. Keeping this bounded leaves enough
+    // node arena space for a full-resolution 1024^3 region.
+    constexpr std::uint32_t kMaxRegions = 64;
+    const std::size_t headerStart = 1;
+    const std::size_t nodeStart = headerStart + kMaxRegions * kHeaderWords;
+    bool changed = !m_worldUploaded;
+    for (const auto& region : state.regions) {
+        const voxel::RegionCoord key{region.x, region.y, region.z};
+        if (region.remove) {
+            if (m_gpuNodes.erase(key) != 0) changed = true;
+            m_gpuRevisions.erase(key);
+            m_gpuNodeCounts.erase(key);
+            continue;
+        }
+        if (region.packedNodes.empty()) continue;
+        if (!m_gpuRevisions.contains(key) || m_gpuRevisions[key] != region.revision) {
+            changed = true;
+            m_gpuRevisions[key] = region.revision;
+            m_gpuNodeCounts[key] =
+                static_cast<std::uint32_t>(region.packedNodes.size() / 3);
+            m_gpuNodes[key] = region.packedNodes;
+        }
     }
-    if (!m_worldUploaded || packed != m_uploadedWorld) {
-      std::memcpy(m_worldMappedData, packed.data(), sizeof(packed));
-      m_uploadedWorld = packed;
-      m_worldUploaded = true;
-      vmaFlushAllocation(m_allocator, m_worldAllocation, 0, sizeof(packed));
-  }
+    if (!changed) return;
+    // The persistent arena is read by both in-flight frames. Wait only when
+    // residency actually changes; camera movement alone performs no upload.
+    vkDeviceWaitIdle(m_device);
+    auto* words = static_cast<std::uint32_t*>(m_worldMappedData);
+    const std::size_t bufferWords = m_worldBufferCapacity / sizeof(std::uint32_t);
+    std::fill(words, words + bufferWords, 0u);
+    std::uint32_t headerIndex = 0;
+    std::vector<voxel::RegionCoord> candidates;
+    candidates.reserve(m_gpuNodes.size());
+    for (const auto& [key, nodes] : m_gpuNodes)
+        if (!nodes.empty()) candidates.push_back(key);
+    std::sort(candidates.begin(), candidates.end(), [&](const auto& left, const auto& right) {
+        const glm::vec3 center = state.localPlayer.position;
+        const auto distance = [&](const voxel::RegionCoord& key) {
+            const glm::vec3 regionCenter{
+                (static_cast<float>(key.x) + 0.5f) * voxel::kRegionEdge,
+                (static_cast<float>(key.y) + 0.5f) * voxel::kRegionEdge,
+                (static_cast<float>(key.z) + 0.5f) * voxel::kRegionEdge};
+            const glm::vec3 delta = center - regionCenter;
+            return glm::dot(delta, delta);
+        };
+        return distance(left) < distance(right);
+    });
+    std::size_t nodeOffset = nodeStart;
+    for (const auto& key : candidates) {
+        const auto& nodes = m_gpuNodes[key];
+        if (headerIndex == kMaxRegions ||
+            nodeOffset + nodes.size() > bufferWords) {
+            std::cerr << "Vulkan: GPU SVO arena full; evicting distant region\n";
+            continue;
+        }
+        const std::size_t header = headerStart + headerIndex * kHeaderWords;
+        words[header + 0] = key.x;
+        words[header + 1] = key.y;
+        words[header + 2] = key.z;
+        words[header + 3] = static_cast<std::uint32_t>(nodeOffset);
+        words[header + 4] = m_gpuNodeCounts[key];
+        words[header + 5] = m_gpuRevisions[key];
+        std::memcpy(words + nodeOffset, nodes.data(), nodes.size() * sizeof(std::uint32_t));
+        nodeOffset += nodes.size();
+        ++headerIndex;
+    }
+    words[0] = headerIndex;
+    if (headerIndex == 0 && !state.regions.empty())
+        std::cerr << "Vulkan: received region updates but uploaded zero regions\n";
+    else if (headerIndex != 0 && !m_worldUploaded)
+        std::cerr << "Vulkan: uploaded " << headerIndex << " SVO regions\n";
+    m_worldUploaded = true;
+    vmaFlushAllocation(m_allocator, m_worldAllocation, 0, m_worldBufferCapacity);
 }
 
 void VulkanContext::createComputeImages() {
@@ -563,6 +630,9 @@ void VulkanContext::updateOverlayBuffer(FrameData& frame, const std::vector<Over
 }
 
 void VulkanContext::cleanupSwapchain() {
+  for (auto semaphore : m_renderFinishedSemaphores)
+    if (semaphore) vkDestroySemaphore(m_device, semaphore, nullptr);
+  m_renderFinishedSemaphores.clear();
   for (auto view : m_swapchainImageViews)
     vkDestroyImageView(m_device, view, nullptr);
   m_swapchainImageViews.clear();
@@ -624,7 +694,10 @@ void VulkanContext::recordCommands(FrameData &frame, uint32_t imageIndex, float 
           std::sin(glm::radians(state.localPlayer.yaw)) *
               std::cos(glm::radians(state.localPlayer.pitch)),
           std::sin(glm::radians(state.localPlayer.pitch)))), 0.0f),
-      voxel::kWorldEdge
+      voxel::kWorldWidth,
+      voxel::kWorldDepth,
+      256,
+      1.5f
   };
   vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
   vkCmdDispatch(cmd, (m_swapchain.extent.width + 7) / 8, (m_swapchain.extent.height + 7) / 8, 1);
@@ -644,8 +717,8 @@ void VulkanContext::recordCommands(FrameData &frame, uint32_t imageIndex, float 
   postComputeBarriers[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
   postComputeBarriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-  postComputeBarriers[1].srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-  postComputeBarriers[1].srcAccessMask = 0;
+  postComputeBarriers[1].srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+  postComputeBarriers[1].srcAccessMask = VK_ACCESS_2_NONE;
   postComputeBarriers[1].dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
   postComputeBarriers[1].dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
   postComputeBarriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -717,7 +790,7 @@ void VulkanContext::recordCommands(FrameData &frame, uint32_t imageIndex, float 
 }
 
 void VulkanContext::drawFrame(float deltaTime, float totalTime,
-                              const voxel::RenderState& state) {
+                              voxel::RenderState& state) {
   if (m_framebufferResized || m_window->isMinimized()) {
     recreateSwapchain();
     if (m_window->isMinimized() || m_swapchain.extent.width == 0 || m_swapchain.extent.height == 0)
@@ -739,7 +812,16 @@ void VulkanContext::drawFrame(float deltaTime, float totalTime,
     checkVk(result, "acquire swapchain image");
 
   if (m_imagesInFlight[imageIndex] != VK_NULL_HANDLE && m_imagesInFlight[imageIndex] != frame.inFlight)
-    checkVk(vkWaitForFences(m_device, 1, &m_imagesInFlight[imageIndex], VK_TRUE, std::numeric_limits<uint64_t>::max()), "wait for swapchain image fence");
+  {
+    const VkResult fenceResult = vkWaitForFences(
+        m_device, 1, &m_imagesInFlight[imageIndex], VK_TRUE,
+        std::numeric_limits<uint64_t>::max());
+    if (fenceResult == VK_ERROR_DEVICE_LOST)
+      throw std::runtime_error(
+          "wait for swapchain image fence failed: VK_ERROR_DEVICE_LOST "
+          "(GPU workload likely exceeded the MoltenVK watchdog)");
+    checkVk(fenceResult, "wait for swapchain image fence");
+  }
   m_imagesInFlight[imageIndex] = frame.inFlight;
 
   checkVk(vkResetFences(m_device, 1, &frame.inFlight), "reset frame fence");
@@ -773,6 +855,7 @@ void VulkanContext::drawFrame(float deltaTime, float totalTime,
   updateOverlayBuffer(frame, m_ui.getVertices());
 
   uploadWorld(state);
+  state.regions.clear();
   recordCommands(frame, imageIndex, deltaTime, totalTime, state);
 
   // Modern Vulkan 1.3 synchronization2 submission
@@ -787,7 +870,7 @@ void VulkanContext::drawFrame(float deltaTime, float totalTime,
 
   VkSemaphoreSubmitInfo signalInfo{};
   signalInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-  signalInfo.semaphore = frame.renderFinished;
+  signalInfo.semaphore = m_renderFinishedSemaphores[imageIndex];
   signalInfo.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
 
   VkSubmitInfo2 submitInfo{};
@@ -799,12 +882,19 @@ void VulkanContext::drawFrame(float deltaTime, float totalTime,
   submitInfo.signalSemaphoreInfoCount = 1;
   submitInfo.pSignalSemaphoreInfos = &signalInfo;
 
-  checkVk(vkQueueSubmit2(m_graphicsQueue, 1, &submitInfo, frame.inFlight), "submit frame");
+  const VkResult submitResult =
+      vkQueueSubmit2(m_graphicsQueue, 1, &submitInfo, frame.inFlight);
+  if (submitResult == VK_ERROR_DEVICE_LOST) {
+    throw std::runtime_error(
+        "submit frame failed: VK_ERROR_DEVICE_LOST "
+        "(Metal rejected the GPU workload; ray traversal was bounded)");
+  }
+  checkVk(submitResult, "submit frame");
 
   VkPresentInfoKHR present{};
   present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
   present.waitSemaphoreCount = 1;
-  present.pWaitSemaphores = &frame.renderFinished;
+  present.pWaitSemaphores = &m_renderFinishedSemaphores[imageIndex];
   present.swapchainCount = 1;
   present.pSwapchains = &m_swapchain.swapchain;
   present.pImageIndices = &imageIndex;

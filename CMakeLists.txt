@@ -190,8 +190,10 @@ add_executable(VoxelRenderer
 	src/renderer/vulkancontext.cpp
 	src/renderer/ui.cpp
 	src/simulation/authority.cpp
+	src/simulation/svo.cpp
 	src/network/protocol.cpp
 	src/network/udp_socket.cpp
+	src/network/tcp_socket.cpp
 	src/network/server.cpp
 	src/network/client.cpp
 	"${VERTEX_SHADER}"
@@ -246,5 +248,14 @@ endif()
 
 if(VOXEL_BUILD_TESTS)
 	enable_testing()
-	message(STATUS "VOXEL_BUILD_TESTS is enabled; add tests under tests/ to register them")
+	add_executable(VoxelSvoTests
+		tests/svo_test.cpp
+		src/simulation/svo.cpp
+		src/network/protocol.cpp
+	)
+	target_include_directories(VoxelSvoTests PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/src"
+	)
+	target_link_libraries(VoxelSvoTests PRIVATE glm::glm)
+	add_test(NAME VoxelSvoTests COMMAND VoxelSvoTests)
 endif()
