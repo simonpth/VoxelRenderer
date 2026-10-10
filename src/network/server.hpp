@@ -1,6 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
+#include <vector>
 #include <mutex>
 #include <thread>
 #include "protocol.hpp"
@@ -17,18 +19,25 @@ public:
     void start();
     void stop();
 private:
+    struct ClientConnection {
+        ClientUuid uuid{};
+        Peer peer{};
+        std::unique_ptr<Authority> authority;
+        InputIntent latest{};
+        bool jumpRequested = false;
+        std::uint32_t lastClientTick = 0;
+        bool worldSent = false;
+    };
+
     void run();
     void receive();
     std::uint16_t m_port;
     std::atomic_bool m_running{false};
     std::thread m_thread;
     UdpSocket m_socket;
-    Authority m_authority{1};
     std::mutex m_mutex;
-    InputIntent m_latest{};
-    bool m_jumpRequested = false;
-    std::uint32_t m_lastClientTick = 0;
-    Peer m_peer{};
-    bool m_worldSent = false;
+    std::vector<ClientConnection> m_clients;
+    std::uint32_t m_nextPlayerId = 1;
+    std::uint32_t m_tick = 0;
 };
 }

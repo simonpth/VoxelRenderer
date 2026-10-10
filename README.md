@@ -9,11 +9,16 @@ The simulation is built around a strict authority boundary:
   are versioned, little-endian, finite-value checked, and rejected when their
   shape or tick ordering is invalid.
 - `network/server` owns the simulation timeline. It retains the latest valid
-  intent and never accepts a client position or velocity.
+  intent for each registered client, never accepts a client position or
+  velocity, and sends snapshots containing all connected players.
 - `network/client` receives snapshots on a worker thread and maintains a
   thread-safe snapshot queue. The render thread consumes only a copied
   interpolated `RenderState`; Vulkan has no access to sockets or network
   queues.
+
+Clients register with a randomly generated 128-bit UUID before sending input.
+The server assigns each UUID an independent authority and aggregates the
+resulting player states into every connected client's snapshot.
 
 The server creates the terrain from a two-dimensional sine-height function at
 startup. It sends that authoritative 32^3 voxel array as bounded UDP

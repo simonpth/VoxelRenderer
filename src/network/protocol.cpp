@@ -10,6 +10,9 @@ void u16(std::vector<std::byte>& out, std::uint16_t value) {
 void u32(std::vector<std::byte>& out, std::uint32_t value) {
     for (unsigned shift = 0; shift < 32; shift += 8) out.push_back(std::byte(value >> shift));
 }
+void uuid(std::vector<std::byte>& out, const ClientUuid& value) {
+    for (const auto byte : value) out.push_back(std::byte(byte));
+}
 void f32(std::vector<std::byte>& out, float value) {
     std::uint32_t bits; std::memcpy(&bits, &value, sizeof bits); u32(out, bits);
 }
@@ -25,6 +28,11 @@ bool u32(std::span<const std::byte> in, std::size_t& at, std::uint32_t& value) {
     if (in.size() - at < 4) return false; value = 0;
     for (unsigned shift = 0; shift < 32; shift += 8) value |=
         std::to_integer<std::uint32_t>(in[at++]) << shift;
+    return true;
+}
+bool uuid(std::span<const std::byte> in, std::size_t& at, ClientUuid& value) {
+    if (in.size() - at < value.size()) return false;
+    for (auto& byte : value) byte = std::to_integer<std::uint8_t>(in[at++]);
     return true;
 }
 bool f32(std::span<const std::byte> in, std::size_t& at, float& value) {
@@ -57,6 +65,15 @@ std::vector<std::byte> encode(const InputIntent& i) {
     vec2(out, i.horizontalDelta); vec2(out, i.look);
     out.push_back(std::byte(i.jumpPressed)); return out;
 }
+std::vector<std::byte> encode(const Registration& registration) {
+    std::vector<std::byte> out; header(out, PacketKind::Registration);
+    uuid(out, registration.uuid); return out;
+}
+std::vector<std::byte> encode(const RegistrationAck& acknowledgement) {
+    std::vector<std::byte> out; header(out, PacketKind::RegistrationAck);
+    uuid(out, acknowledgement.uuid); u32(out, acknowledgement.playerId);
+    return out;
+}
 std::vector<std::byte> encode(const AuthoritativeState& s) {
     std::vector<std::byte> out; header(out, PacketKind::Snapshot);
     u32(out, s.tick); u32(out, s.worldRevision); u32(out, s.acknowledgedInputTick);
@@ -87,6 +104,17 @@ bool decode(std::span<const std::byte> in, InputIntent& i) {
     return begin(in, at, PacketKind::Intent) && u32(in, at, i.clientTick) &&
            vec2(in, at, i.horizontalDelta) && vec2(in, at, i.look) && at < in.size() &&
            ((i.jumpPressed = std::to_integer<unsigned>(in[at++]) != 0), at == in.size());
+}
+bool decode(std::span<const std::byte> in, Registration& registration) {
+    std::size_t at = 0;
+    return begin(in, at, PacketKind::Registration) &&
+           uuid(in, at, registration.uuid) && at == in.size();
+}
+bool decode(std::span<const std::byte> in, RegistrationAck& acknowledgement) {
+    std::size_t at = 0;
+    return begin(in, at, PacketKind::RegistrationAck) &&
+           uuid(in, at, acknowledgement.uuid) &&
+           u32(in, at, acknowledgement.playerId) && at == in.size();
 }
 bool decode(std::span<const std::byte> in, AuthoritativeState& s) {
     std::size_t at = 0; if (!begin(in, at, PacketKind::Snapshot) ||

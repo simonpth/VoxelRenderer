@@ -21,15 +21,41 @@ void Server::receive() {
     for (;;) {
         Peer peer; const auto size = m_socket.receive(buffer, peer);
         if (size <= 0) return;
+        const auto bytes = std::span<const std::byte>(
+            buffer.data(), static_cast<std::size_t>(size));
+        Registration registration{};
+        if (decode(bytes, registration)) {
+            std::scoped_lock lock(m_mutex);
+            auto client = std::find_if(m_clients.begin(), m_clients.end(),
+                [&](const ClientConnection& candidate) {
+                    return candidate.uuid == registration.uuid;
+                });
+            if (client == m_clients.end()) {
+                if (m_clients.size() >= AuthoritativeState{}.players.size()) continue;
+                ClientConnection connection{};
+                connection.uuid = registration.uuid;
+                connection.peer = peer;
+                connection.authority = std::make_unique<Authority>(m_nextPlayerId++);
+                m_clients.push_back(std::move(connection));
+                client = std::prev(m_clients.end());
+            } else {
+                client->peer = peer;
+            }
+            m_socket.send(encode(RegistrationAck{
+                registration.uuid, client->authority->state().localPlayer.id}), peer);
+            continue;
+        }
         InputIntent intent{};
-        if (!decode({buffer.data(), static_cast<std::size_t>(size)}, intent) ||
+        if (!decode(bytes, intent) ||
             glm::length(intent.horizontalDelta) > 0.25f ||
             std::abs(intent.look.x) > 90.0f || std::abs(intent.look.y) > 90.0f) continue;
         std::scoped_lock lock(m_mutex);
-        if (intent.clientTick > m_lastClientTick || peer != m_peer) {
-            if (peer != m_peer) m_worldSent = false;
-            m_jumpRequested = m_jumpRequested || intent.jumpPressed;
-            m_latest = intent; m_lastClientTick = intent.clientTick; m_peer = std::move(peer);
+        const auto client = std::find_if(m_clients.begin(), m_clients.end(),
+            [&](const ClientConnection& candidate) { return candidate.peer == peer; });
+        if (client != m_clients.end() && intent.clientTick > client->lastClientTick) {
+            client->jumpRequested = client->jumpRequested || intent.jumpPressed;
+            client->latest = intent;
+            client->lastClientTick = intent.clientTick;
         }
     }
 }
@@ -41,34 +67,40 @@ void Server::run() {
     while (m_running) {
         receive();
         if (Clock::now() >= next) {
-            InputIntent intent{};
-            Peer peer;
-            {
-                std::scoped_lock lock(m_mutex);
-                intent = m_latest; peer = m_peer;
-                intent.jumpPressed = m_jumpRequested;
-                m_jumpRequested = false;
-            }
-            if (intent.clientTick <= m_authority.state().acknowledgedInputTick) {
-                intent = {};
-            }
-            m_authority.step(intent, kTickSeconds);
-            if (peer.port != 0) {
-                if (!m_worldSent || peer != m_peer) {
+            std::scoped_lock lock(m_mutex);
+            ++m_tick;
+            for (auto& client : m_clients) {
+                InputIntent intent = client.latest;
+                intent.jumpPressed = client.jumpRequested;
+                client.jumpRequested = false;
+                if (intent.clientTick <=
+                    client.authority->state().acknowledgedInputTick) intent = {};
+                client.authority->step(intent, kTickSeconds);
+
+                AuthoritativeState snapshot = client.authority->state();
+                snapshot.tick = m_tick;
+                snapshot.playerCount = static_cast<std::uint8_t>(
+                    std::min(m_clients.size(), snapshot.players.size()));
+                for (std::size_t i = 0; i < snapshot.playerCount; ++i) {
+                    snapshot.players[i] = m_clients[i].authority->state().localPlayer;
+                }
+                if (client.peer.port != 0) {
+                    if (!client.worldSent) {
                     constexpr std::size_t kChunkSize = 64;
                     for (std::size_t offset = 0; offset < kVoxelCount; offset += kChunkSize) {
                         const std::size_t count = std::min(kChunkSize, kVoxelCount - offset);
-                        WorldChunk chunk{m_authority.state().worldRevision,
+                        WorldChunk chunk{snapshot.worldRevision,
                                          static_cast<std::uint32_t>(offset),
-                                         {m_authority.state().world.begin() + offset,
-                                          m_authority.state().world.begin() + offset + count}};
-                        if (!m_socket.send(encode(chunk), peer))
+                                         {snapshot.world.begin() + offset,
+                                          snapshot.world.begin() + offset + count}};
+                        if (!m_socket.send(encode(chunk), client.peer))
                             std::cerr << "Server: world chunk send failed\n";
                     }
-                    m_worldSent = true;
+                    client.worldSent = true;
                 }
-                const auto packet = encode(m_authority.state());
-                if (!m_socket.send(packet, peer)) std::cerr << "Server: snapshot send failed\n";
+                if (!m_socket.send(encode(snapshot), client.peer))
+                    std::cerr << "Server: snapshot send failed\n";
+                }
             }
             next += std::chrono::duration_cast<Clock::duration>(
                 std::chrono::duration<float>(kTickSeconds));
