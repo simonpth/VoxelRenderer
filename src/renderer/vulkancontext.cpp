@@ -24,7 +24,7 @@ T unwrap(vkb::Result<T> &&result, const char *operation) {
 const char *presentModeName(VkPresentModeKHR mode) {
   switch (mode) {
   case VK_PRESENT_MODE_IMMEDIATE_KHR: return "IMMEDIATE (uncapped, may tear)";
-  case VK_PRESENT_MODE_MAILBOX_KHR: return "MAILBOX";
+  case VK_PRESENT_MODE_MAILBOX_KHR: return "MAILBOX (triple buffered, vsynced)";
   case VK_PRESENT_MODE_FIFO_KHR: return "FIFO (vsynced)";
   case VK_PRESENT_MODE_FIFO_RELAXED_KHR: return "FIFO_RELAXED";
   default: return "other";
@@ -37,45 +37,56 @@ VulkanContext::VulkanContext(Window *window) : m_window(window) {
     throw std::invalid_argument("VulkanContext requires a Window");
   if (volkInitialize() != VK_SUCCESS)
     throw std::runtime_error("volkInitialize failed");
+
   initInstance();
   initDevice();
   initAllocator();
   createSwapchain();
   createFrameResources();
-  createComputeResources();
+  createDescriptorSetLayout();
+  createPipelineLayout();
+  createPipelines();
+  createDescriptorPool();
+  createComputeImages();
   createTriangleBuffer();
-  createPipeline();
 }
 
 VulkanContext::~VulkanContext() {
   if (m_device)
     vkDeviceWaitIdle(m_device);
+
   if (m_allocator && m_triangleBuffer)
     vmaDestroyBuffer(m_allocator, m_triangleBuffer, m_triangleAllocation);
+
   if (m_computePipeline)
     vkDestroyPipeline(m_device, m_computePipeline, nullptr);
-  if (m_computePipelineLayout)
-    vkDestroyPipelineLayout(m_device, m_computePipelineLayout, nullptr);
   if (m_pipeline)
     vkDestroyPipeline(m_device, m_pipeline, nullptr);
   if (m_trianglePipeline)
     vkDestroyPipeline(m_device, m_trianglePipeline, nullptr);
   if (m_pipelineLayout)
     vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
-  destroyComputeResources();
+
+  destroyComputeImages();
+
   if (m_descriptorPool)
     vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
   if (m_descriptorSetLayout)
     vkDestroyDescriptorSetLayout(m_device, m_descriptorSetLayout, nullptr);
+
   for (auto &frame : m_frames) {
     if (frame.imageAvailable)
       vkDestroySemaphore(m_device, frame.imageAvailable, nullptr);
+    if (frame.renderFinished)
+      vkDestroySemaphore(m_device, frame.renderFinished, nullptr);
     if (frame.inFlight)
       vkDestroyFence(m_device, frame.inFlight, nullptr);
     if (frame.pool)
       vkDestroyCommandPool(m_device, frame.pool, nullptr);
   }
+
   cleanupSwapchain();
+
   if (m_swapchain.swapchain)
     vkb::destroy_swapchain(m_swapchain);
   if (m_allocator)
@@ -90,7 +101,13 @@ VulkanContext::~VulkanContext() {
 
 void VulkanContext::initInstance() {
   auto extensions = Window::requiredInstanceExtensions();
-  auto instance = unwrap(vkb::InstanceBuilder(Window::getInstanceProcAddr()).set_app_name("Voxel Renderer").set_engine_name("Voxel Renderer").require_api_version(1, 3).enable_extensions(extensions).build(), "create Vulkan instance");
+  auto instance = unwrap(vkb::InstanceBuilder(Window::getInstanceProcAddr())
+                             .set_app_name("Voxel Renderer")
+                             .set_engine_name("Voxel Renderer")
+                             .require_api_version(1, 3)
+                             .enable_extensions(extensions)
+                             .build(),
+                         "create Vulkan instance");
   m_vkbInstance = instance;
   m_instance = instance.instance;
   volkLoadInstance(m_instance);
@@ -147,11 +164,11 @@ void VulkanContext::createSwapchain() {
 
   auto swapchain_ret = builder.set_desired_extent(extent.width, extent.height)
                               .set_desired_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)
+                              .add_fallback_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
                               .add_fallback_present_mode(VK_PRESENT_MODE_FIFO_KHR)
                               .build();
   auto swapchain = unwrap(std::move(swapchain_ret), "create swapchain");
 
-  // After creating the new one, we can safely destroy the old one's handle
   if (m_swapchain.swapchain != VK_NULL_HANDLE) {
     vkb::destroy_swapchain(m_swapchain);
   }
@@ -161,13 +178,7 @@ void VulkanContext::createSwapchain() {
             << " (VkPresentModeKHR=" << static_cast<int>(m_swapchain.present_mode) << ")\n";
   m_swapchainImages = unwrap(m_swapchain.get_images(), "get swapchain images");
   m_swapchainImageViews = unwrap(m_swapchain.get_image_views(), "get swapchain image views");
-  m_renderFinished.resize(m_swapchainImages.size());
   m_imagesInFlight.assign(m_swapchainImages.size(), VK_NULL_HANDLE);
-  for (auto &semaphore : m_renderFinished) {
-    VkSemaphoreCreateInfo info{};
-    info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-    checkVk(vkCreateSemaphore(m_device, &info, nullptr, &semaphore), "create render semaphore");
-  }
 }
 
 void VulkanContext::createFrameResources() {
@@ -177,15 +188,19 @@ void VulkanContext::createFrameResources() {
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = m_graphicsFamily;
     checkVk(vkCreateCommandPool(m_device, &poolInfo, nullptr, &frame.pool), "create command pool");
+
     VkCommandBufferAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     allocInfo.commandPool = frame.pool;
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     allocInfo.commandBufferCount = 1;
     checkVk(vkAllocateCommandBuffers(m_device, &allocInfo, &frame.cmd), "allocate command buffer");
+
     VkSemaphoreCreateInfo semaphoreInfo{};
     semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-    checkVk(vkCreateSemaphore(m_device, &semaphoreInfo, nullptr, &frame.imageAvailable), "create image semaphore");
+    checkVk(vkCreateSemaphore(m_device, &semaphoreInfo, nullptr, &frame.imageAvailable), "create imageAvailable semaphore");
+    checkVk(vkCreateSemaphore(m_device, &semaphoreInfo, nullptr, &frame.renderFinished), "create renderFinished semaphore");
+
     VkFenceCreateInfo fenceInfo{};
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
@@ -193,137 +208,174 @@ void VulkanContext::createFrameResources() {
   }
 }
 
-void VulkanContext::createPipeline() {
-  VkShaderModule vertexShader = createShaderModule(vertexShaderPath);
-  VkShaderModule fragmentShader = createShaderModule(fragmentShaderPath);
-  VkPipelineShaderStageCreateInfo stages[2]{};
-  stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vertexShader, "main", nullptr};
-  stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragmentShader, "main", nullptr};
-  VkPipelineVertexInputStateCreateInfo vertexInput{};
-  vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-  VkPipelineInputAssemblyStateCreateInfo assembly{};
-  assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-  assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-  VkPipelineViewportStateCreateInfo viewport{};
-  viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-  viewport.viewportCount = 1;
-  viewport.scissorCount = 1;
-  VkPipelineRasterizationStateCreateInfo raster{};
-  raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-  raster.lineWidth = 1.0f;
-  raster.cullMode = VK_CULL_MODE_NONE;
-  raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-  raster.polygonMode = VK_POLYGON_MODE_FILL;
-  VkPipelineMultisampleStateCreateInfo multisample{};
-  multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-  multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-  VkPipelineColorBlendAttachmentState blendAttachment{};
-  blendAttachment.colorWriteMask = 0xF;
-  VkPipelineColorBlendStateCreateInfo blend{};
-  blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-  blend.attachmentCount = 1;
-  blend.pAttachments = &blendAttachment;
-  VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-  VkPipelineDynamicStateCreateInfo dynamic{};
-  dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-  dynamic.dynamicStateCount = 2;
-  dynamic.pDynamicStates = dynamicStates;
-  VkPipelineLayoutCreateInfo layoutInfo{};
-  layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-  layoutInfo.setLayoutCount = 1;
-  layoutInfo.pSetLayouts = &m_descriptorSetLayout;
-  if (m_pipelineLayout == VK_NULL_HANDLE)
-    checkVk(vkCreatePipelineLayout(m_device, &layoutInfo, nullptr, &m_pipelineLayout), "create pipeline layout");
-
-  VkPipelineRenderingCreateInfo rendering{};
-  rendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-  rendering.colorAttachmentCount = 1;
-  rendering.pColorAttachmentFormats = &m_swapchain.image_format;
-  VkGraphicsPipelineCreateInfo pipelineInfo{};
-  pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-  pipelineInfo.pNext = &rendering;
-  pipelineInfo.stageCount = 2;
-  pipelineInfo.pStages = stages;
-  pipelineInfo.pVertexInputState = &vertexInput;
-  pipelineInfo.pInputAssemblyState = &assembly;
-  pipelineInfo.pViewportState = &viewport;
-  pipelineInfo.pRasterizationState = &raster;
-  pipelineInfo.pMultisampleState = &multisample;
-  pipelineInfo.pColorBlendState = &blend;
-  pipelineInfo.pDynamicState = &dynamic;
-  pipelineInfo.layout = m_pipelineLayout;
-  checkVk(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipeline), "create graphics pipeline");
-  vkDestroyShaderModule(m_device, vertexShader, nullptr);
-  vkDestroyShaderModule(m_device, fragmentShader, nullptr);
-
-  VkShaderModule overlayVertex = createShaderModule(overlayVertexShaderPath);
-  VkShaderModule overlayFragment = createShaderModule(overlayFragmentShaderPath);
-  VkPipelineShaderStageCreateInfo overlayStages[2]{};
-  overlayStages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, overlayVertex, "main", nullptr};
-  overlayStages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, overlayFragment, "main", nullptr};
-  VkVertexInputBindingDescription binding{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX};
-  VkVertexInputAttributeDescription attributes[] = {{0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, pos)}, {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, color)}};
-  vertexInput.vertexBindingDescriptionCount = 1;
-  vertexInput.pVertexBindingDescriptions = &binding;
-  vertexInput.vertexAttributeDescriptionCount = 2;
-  vertexInput.pVertexAttributeDescriptions = attributes;
-  pipelineInfo.pStages = overlayStages;
-  checkVk(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_trianglePipeline), "create triangle overlay pipeline");
-  vkDestroyShaderModule(m_device, overlayVertex, nullptr);
-  vkDestroyShaderModule(m_device, overlayFragment, nullptr);
-}
-
-void VulkanContext::createTriangleBuffer() {
-  const Vertex vertices[] = {{{0.0f, -0.5f}, {1.0f, 0.0f, 0.0f}}, {{0.5f, 0.5f}, {0.0f, 1.0f, 0.0f}}, {{-0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}}};
-  VkBufferCreateInfo bufferInfo{};
-  bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-  bufferInfo.size = sizeof(vertices);
-  bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
-  VmaAllocationCreateInfo allocationInfo{};
-  allocationInfo.usage = VMA_MEMORY_USAGE_AUTO;
-  allocationInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
-  VmaAllocationInfo mapped{};
-  checkVk(vmaCreateBuffer(m_allocator, &bufferInfo, &allocationInfo, &m_triangleBuffer, &m_triangleAllocation, &mapped), "create triangle buffer");
-  std::memcpy(mapped.pMappedData, vertices, sizeof(vertices));
-}
-
-void VulkanContext::createComputeResources() {
+void VulkanContext::createDescriptorSetLayout() {
   VkDescriptorSetLayoutBinding bindings[2]{};
   bindings[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
   bindings[1] = {1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+
   VkDescriptorSetLayoutCreateInfo setInfo{};
   setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
   setInfo.bindingCount = 2;
   setInfo.pBindings = bindings;
   checkVk(vkCreateDescriptorSetLayout(m_device, &setInfo, nullptr, &m_descriptorSetLayout), "create descriptor set layout");
+}
 
-  VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
-  pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-  pipelineLayoutInfo.setLayoutCount = 1;
-  pipelineLayoutInfo.pSetLayouts = &m_descriptorSetLayout;
-  checkVk(vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_computePipelineLayout), "create compute pipeline layout");
+void VulkanContext::createPipelineLayout() {
+  VkPushConstantRange pushConstantRange{};
+  pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  pushConstantRange.offset = 0;
+  pushConstantRange.size = sizeof(ComputePushConstants);
 
-  VkShaderModule shader = createShaderModule(computeShaderPath);
-  VkPipelineShaderStageCreateInfo stage{};
-  stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-  stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-  stage.module = shader;
-  stage.pName = "main";
-  VkComputePipelineCreateInfo pipelineInfo{};
-  pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-  pipelineInfo.stage = stage;
-  pipelineInfo.layout = m_computePipelineLayout;
-  VkResult result = vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_computePipeline);
-  vkDestroyShaderModule(m_device, shader, nullptr);
-  checkVk(result, "create compute pipeline");
+  VkPipelineLayoutCreateInfo layoutInfo{};
+  layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  layoutInfo.setLayoutCount = 1;
+  layoutInfo.pSetLayouts = &m_descriptorSetLayout;
+  layoutInfo.pushConstantRangeCount = 1;
+  layoutInfo.pPushConstantRanges = &pushConstantRange;
 
-  VkDescriptorPoolSize poolSizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kFramesInFlight}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kFramesInFlight}};
+  checkVk(vkCreatePipelineLayout(m_device, &layoutInfo, nullptr, &m_pipelineLayout), "create pipeline layout");
+}
+
+void VulkanContext::createPipelines() {
+  // 1. Compute pipeline
+  {
+    VkShaderModule shader = createShaderModule(computeShaderPath);
+    VkPipelineShaderStageCreateInfo stage{};
+    stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    stage.module = shader;
+    stage.pName = "main";
+
+    VkComputePipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipelineInfo.stage = stage;
+    pipelineInfo.layout = m_pipelineLayout;
+    VkResult result = vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_computePipeline);
+    vkDestroyShaderModule(m_device, shader, nullptr);
+    checkVk(result, "create compute pipeline");
+  }
+
+  // 2. Fullscreen blit graphics pipeline
+  {
+    VkShaderModule vertexShader = createShaderModule(vertexShaderPath);
+    VkShaderModule fragmentShader = createShaderModule(fragmentShaderPath);
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vertexShader, "main", nullptr};
+    stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragmentShader, "main", nullptr};
+
+    VkPipelineVertexInputStateCreateInfo vertexInput{};
+    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+    VkPipelineInputAssemblyStateCreateInfo assembly{};
+    assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo viewport{};
+    viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewport.viewportCount = 1;
+    viewport.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo raster{};
+    raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    raster.lineWidth = 1.0f;
+    raster.cullMode = VK_CULL_MODE_NONE;
+    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    raster.polygonMode = VK_POLYGON_MODE_FILL;
+
+    VkPipelineMultisampleStateCreateInfo multisample{};
+    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineColorBlendAttachmentState blendAttachment{};
+    blendAttachment.colorWriteMask = 0xF;
+
+    VkPipelineColorBlendStateCreateInfo blend{};
+    blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    blend.attachmentCount = 1;
+    blend.pAttachments = &blendAttachment;
+
+    VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{};
+    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamic.dynamicStateCount = 2;
+    dynamic.pDynamicStates = dynamicStates;
+
+    VkPipelineRenderingCreateInfo rendering{};
+    rendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachmentFormats = &m_swapchain.image_format;
+
+    VkGraphicsPipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.pNext = &rendering;
+    pipelineInfo.stageCount = 2;
+    pipelineInfo.pStages = stages;
+    pipelineInfo.pVertexInputState = &vertexInput;
+    pipelineInfo.pInputAssemblyState = &assembly;
+    pipelineInfo.pViewportState = &viewport;
+    pipelineInfo.pRasterizationState = &raster;
+    pipelineInfo.pMultisampleState = &multisample;
+    pipelineInfo.pColorBlendState = &blend;
+    pipelineInfo.pDynamicState = &dynamic;
+    pipelineInfo.layout = m_pipelineLayout;
+
+    checkVk(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipeline), "create graphics pipeline");
+    vkDestroyShaderModule(m_device, vertexShader, nullptr);
+    vkDestroyShaderModule(m_device, fragmentShader, nullptr);
+
+    // 3. Triangle overlay graphics pipeline
+    VkShaderModule overlayVertex = createShaderModule(overlayVertexShaderPath);
+    VkShaderModule overlayFragment = createShaderModule(overlayFragmentShaderPath);
+    VkPipelineShaderStageCreateInfo overlayStages[2]{};
+    overlayStages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, overlayVertex, "main", nullptr};
+    overlayStages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, overlayFragment, "main", nullptr};
+
+    VkVertexInputBindingDescription binding{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription attributes[] = {
+        {0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, pos)},
+        {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, color)}
+    };
+    vertexInput.vertexBindingDescriptionCount = 1;
+    vertexInput.pVertexBindingDescriptions = &binding;
+    vertexInput.vertexAttributeDescriptionCount = 2;
+    vertexInput.pVertexAttributeDescriptions = attributes;
+    pipelineInfo.pStages = overlayStages;
+
+    checkVk(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_trianglePipeline), "create triangle overlay pipeline");
+    vkDestroyShaderModule(m_device, overlayVertex, nullptr);
+    vkDestroyShaderModule(m_device, overlayFragment, nullptr);
+  }
+}
+
+void VulkanContext::createDescriptorPool() {
+  VkDescriptorPoolSize poolSizes[] = {
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kFramesInFlight}
+  };
+
   VkDescriptorPoolCreateInfo poolInfo{};
   poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   poolInfo.maxSets = kFramesInFlight;
   poolInfo.poolSizeCount = 2;
   poolInfo.pPoolSizes = poolSizes;
   checkVk(vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_descriptorPool), "create descriptor pool");
+
+  std::array<VkDescriptorSetLayout, kFramesInFlight> layouts{};
+  layouts.fill(m_descriptorSetLayout);
+  std::array<VkDescriptorSet, kFramesInFlight> descriptorSets{};
+  VkDescriptorSetAllocateInfo setAlloc{};
+  setAlloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  setAlloc.descriptorPool = m_descriptorPool;
+  setAlloc.descriptorSetCount = kFramesInFlight;
+  setAlloc.pSetLayouts = layouts.data();
+  checkVk(vkAllocateDescriptorSets(m_device, &setAlloc, descriptorSets.data()), "allocate compute descriptor sets");
+
+  for (uint32_t i = 0; i < kFramesInFlight; ++i) {
+    m_frames[i].computeDescriptorSet = descriptorSets[i];
+  }
+}
+
+void VulkanContext::createComputeImages() {
   VkImageCreateInfo imageInfo{};
   imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
   imageInfo.imageType = VK_IMAGE_TYPE_2D;
@@ -335,22 +387,14 @@ void VulkanContext::createComputeResources() {
   imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
   imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
   imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
   VmaAllocationCreateInfo allocationInfo{};
   allocationInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-  std::array<VkDescriptorSetLayout, kFramesInFlight> layouts{};
-  layouts.fill(m_descriptorSetLayout);
-  std::array<VkDescriptorSet, kFramesInFlight> descriptorSets{};
-  VkDescriptorSetAllocateInfo setAlloc{};
-  setAlloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-  setAlloc.descriptorPool = m_descriptorPool;
-  setAlloc.descriptorSetCount = kFramesInFlight;
-  setAlloc.pSetLayouts = layouts.data();
-  checkVk(vkAllocateDescriptorSets(m_device, &setAlloc, descriptorSets.data()), "allocate compute descriptor sets");
 
   for (uint32_t index = 0; index < kFramesInFlight; ++index) {
-    auto& frame = m_frames[index];
-    frame.computeDescriptorSet = descriptorSets[index];
+    auto &frame = m_frames[index];
     checkVk(vmaCreateImage(m_allocator, &imageInfo, &allocationInfo, &frame.computeImage, &frame.computeAllocation, nullptr), "create compute image");
+
     VkImageViewCreateInfo viewInfo{};
     viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     viewInfo.image = frame.computeImage;
@@ -358,39 +402,67 @@ void VulkanContext::createComputeResources() {
     viewInfo.format = m_computeImageFormat;
     viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     checkVk(vkCreateImageView(m_device, &viewInfo, nullptr, &frame.computeImageView), "create compute image view");
+
     VkDescriptorImageInfo storageImage{VK_NULL_HANDLE, frame.computeImageView, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo sampledImage{VK_NULL_HANDLE, frame.computeImageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    VkWriteDescriptorSet writes[2]{};
-    for (auto& write : writes) write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[0].dstSet = frame.computeDescriptorSet; writes[0].dstBinding = 0; writes[0].descriptorCount = 1;
-    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[0].pImageInfo = &storageImage;
-    writes[1].dstSet = frame.computeDescriptorSet; writes[1].dstBinding = 1; writes[1].descriptorCount = 1;
-    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; writes[1].pImageInfo = &sampledImage;
-    vkUpdateDescriptorSets(m_device, 2, writes, 0, nullptr);
-  }
-}
 
-void VulkanContext::destroyComputeResources() {
-  if (m_descriptorPool) vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
-  m_descriptorPool = VK_NULL_HANDLE;
-  for (auto& frame : m_frames) {
-    if (frame.computeImageView) vkDestroyImageView(m_device, frame.computeImageView, nullptr);
-    if (frame.computeImage) vmaDestroyImage(m_allocator, frame.computeImage, frame.computeAllocation);
-    frame.computeImage = VK_NULL_HANDLE;
-    frame.computeAllocation = VK_NULL_HANDLE;
-    frame.computeImageView = VK_NULL_HANDLE;
-    frame.computeDescriptorSet = VK_NULL_HANDLE;
+    VkWriteDescriptorSet writes[2]{};
+    for (auto &write : writes) write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = frame.computeDescriptorSet;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[0].pImageInfo = &storageImage;
+
+    writes[1].dstSet = frame.computeDescriptorSet;
+    writes[1].dstBinding = 1;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[1].pImageInfo = &sampledImage;
+
+    vkUpdateDescriptorSets(m_device, 2, writes, 0, nullptr);
     frame.computeImageInitialized = false;
   }
-  if (m_descriptorSetLayout) vkDestroyDescriptorSetLayout(m_device, m_descriptorSetLayout, nullptr);
-  m_descriptorSetLayout = VK_NULL_HANDLE;
 }
 
-/* old vertex-buffer path removed: a generated full-screen triangle has no buffer traffic. */
+void VulkanContext::destroyComputeImages() {
+  for (auto &frame : m_frames) {
+    if (frame.computeImageView) {
+      vkDestroyImageView(m_device, frame.computeImageView, nullptr);
+      frame.computeImageView = VK_NULL_HANDLE;
+    }
+    if (frame.computeImage) {
+      vmaDestroyImage(m_allocator, frame.computeImage, frame.computeAllocation);
+      frame.computeImage = VK_NULL_HANDLE;
+      frame.computeAllocation = VK_NULL_HANDLE;
+    }
+    frame.computeImageInitialized = false;
+  }
+}
+
+void VulkanContext::createTriangleBuffer() {
+  const Vertex vertices[] = {
+      {{0.0f, -0.5f}, {1.0f, 0.0f, 0.0f}},
+      {{0.5f, 0.5f}, {0.0f, 1.0f, 0.0f}},
+      {{-0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}}
+  };
+
+  VkBufferCreateInfo bufferInfo{};
+  bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  bufferInfo.size = sizeof(vertices);
+  bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+
+  VmaAllocationCreateInfo allocationInfo{};
+  allocationInfo.usage = VMA_MEMORY_USAGE_AUTO;
+  allocationInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+  VmaAllocationInfo mapped{};
+  checkVk(vmaCreateBuffer(m_allocator, &bufferInfo, &allocationInfo, &m_triangleBuffer, &m_triangleAllocation, &mapped), "create triangle buffer");
+  std::memcpy(mapped.pMappedData, vertices, sizeof(vertices));
+  vmaFlushAllocation(m_allocator, m_triangleAllocation, 0, sizeof(vertices));
+}
+
 void VulkanContext::cleanupSwapchain() {
-  for (auto semaphore : m_renderFinished)
-    vkDestroySemaphore(m_device, semaphore, nullptr);
-  m_renderFinished.clear();
   for (auto view : m_swapchainImageViews)
     vkDestroyImageView(m_device, view, nullptr);
   m_swapchainImageViews.clear();
@@ -400,159 +472,210 @@ void VulkanContext::recreateSwapchain() {
   VkExtent2D extent = m_window->framebufferExtent();
   if (extent.width == 0 || extent.height == 0)
     return;
+
   vkDeviceWaitIdle(m_device);
   cleanupSwapchain();
   createSwapchain();
-  if (m_pipeline) vkDestroyPipeline(m_device, m_pipeline, nullptr);
-  if (m_trianglePipeline) vkDestroyPipeline(m_device, m_trianglePipeline, nullptr);
-  if (m_pipelineLayout) vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
-  if (m_computePipeline) vkDestroyPipeline(m_device, m_computePipeline, nullptr);
-  if (m_computePipelineLayout) vkDestroyPipelineLayout(m_device, m_computePipelineLayout, nullptr);
-  m_pipeline = VK_NULL_HANDLE;
-  m_trianglePipeline = VK_NULL_HANDLE;
-  m_pipelineLayout = VK_NULL_HANDLE;
-  m_computePipeline = VK_NULL_HANDLE;
-  m_computePipelineLayout = VK_NULL_HANDLE;
-  destroyComputeResources();
-  createComputeResources();
-  createPipeline();
+  destroyComputeImages();
+  createComputeImages();
   m_framebufferResized = false;
 }
 
-void VulkanContext::recordCommands(FrameData& frame, uint32_t imageIndex) {
+void VulkanContext::recordCommands(FrameData &frame, uint32_t imageIndex, float deltaTime, float totalTime) {
   VkCommandBuffer cmd = frame.cmd;
   VkCommandBufferBeginInfo begin{};
   begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
   checkVk(vkBeginCommandBuffer(cmd, &begin), "begin command buffer");
 
-  VkImageMemoryBarrier2 computeBarrier{};
-  computeBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-  computeBarrier.srcStageMask = frame.computeImageInitialized ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT : VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-  computeBarrier.srcAccessMask = frame.computeImageInitialized ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : 0;
-  computeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-  computeBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-  computeBarrier.oldLayout = frame.computeImageInitialized ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
-  computeBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-  computeBarrier.image = frame.computeImage;
-  computeBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  VkDependencyInfo computeDependency{};
-  computeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-  computeDependency.imageMemoryBarrierCount = 1;
-  computeDependency.pImageMemoryBarriers = &computeBarrier;
-  vkCmdPipelineBarrier2(cmd, &computeDependency);
+  // 1. Transition compute image for storage writes
+  VkImageMemoryBarrier2 preComputeBarrier{};
+  preComputeBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+  preComputeBarrier.srcStageMask = frame.computeImageInitialized ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT : VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+  preComputeBarrier.srcAccessMask = frame.computeImageInitialized ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : 0;
+  preComputeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+  preComputeBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+  preComputeBarrier.oldLayout = frame.computeImageInitialized ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+  preComputeBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+  preComputeBarrier.image = frame.computeImage;
+  preComputeBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+  VkDependencyInfo preComputeDep{};
+  preComputeDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+  preComputeDep.imageMemoryBarrierCount = 1;
+  preComputeDep.pImageMemoryBarriers = &preComputeBarrier;
+  vkCmdPipelineBarrier2(cmd, &preComputeDep);
   frame.computeImageInitialized = true;
+
+  // 2. Dispatch compute shader with push constants
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_computePipeline);
-  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_computePipelineLayout, 0, 1, &frame.computeDescriptorSet, 0, nullptr);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &frame.computeDescriptorSet, 0, nullptr);
+
+  ComputePushConstants pushConstants{
+      m_swapchain.extent.width,
+      m_swapchain.extent.height,
+      totalTime,
+      deltaTime
+  };
+  vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
   vkCmdDispatch(cmd, (m_swapchain.extent.width + 7) / 8, (m_swapchain.extent.height + 7) / 8, 1);
-  computeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-  computeBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-  computeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-  computeBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-  computeBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-  computeBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  vkCmdPipelineBarrier2(cmd, &computeDependency);
 
-  VkImageMemoryBarrier2 barrier{};
-  barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-  barrier.image = m_swapchainImages[imageIndex];
-  barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  barrier.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-  barrier.srcAccessMask = 0;
-  barrier.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-  barrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-  barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  // 3. Batched barrier:
+  //    - Transition computeImage from GENERAL to SHADER_READ_ONLY_OPTIMAL (ready for fragment shader read)
+  //    - Transition swapchain image from UNDEFINED to COLOR_ATTACHMENT_OPTIMAL (ready for render pass)
+  VkImageMemoryBarrier2 postComputeBarriers[2]{};
+  postComputeBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+  postComputeBarriers[0].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+  postComputeBarriers[0].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+  postComputeBarriers[0].dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  postComputeBarriers[0].dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+  postComputeBarriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+  postComputeBarriers[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  postComputeBarriers[0].image = frame.computeImage;
+  postComputeBarriers[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
-  VkDependencyInfo dependency{};
-  dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-  dependency.imageMemoryBarrierCount = 1;
-  dependency.pImageMemoryBarriers = &barrier;
+  postComputeBarriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+  postComputeBarriers[1].srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+  postComputeBarriers[1].srcAccessMask = 0;
+  postComputeBarriers[1].dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+  postComputeBarriers[1].dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+  postComputeBarriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  postComputeBarriers[1].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  postComputeBarriers[1].image = m_swapchainImages[imageIndex];
+  postComputeBarriers[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
-  vkCmdPipelineBarrier2(cmd, &dependency);
+  VkDependencyInfo postComputeDep{};
+  postComputeDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+  postComputeDep.imageMemoryBarrierCount = 2;
+  postComputeDep.pImageMemoryBarriers = postComputeBarriers;
+  vkCmdPipelineBarrier2(cmd, &postComputeDep);
 
-  VkClearValue clear{};
-  clear.color = {{0.04f, 0.06f, 0.1f, 1.0f}};
+  // 4. Begin Dynamic Rendering with DONT_CARE load op (fullscreen quad immediately covers all pixels)
   VkRenderingAttachmentInfo attachment{};
   attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
   attachment.imageView = m_swapchainImageViews[imageIndex];
   attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-  attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
   attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-  attachment.clearValue = clear;
+
   VkRenderingInfo rendering{};
   rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
   rendering.renderArea.extent = m_swapchain.extent;
   rendering.layerCount = 1;
   rendering.colorAttachmentCount = 1;
   rendering.pColorAttachments = &attachment;
+
   vkCmdBeginRendering(cmd, &rendering);
+
+  // 5. Fullscreen blit
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &frame.computeDescriptorSet, 0, nullptr);
-  VkViewport vp{0, 0, static_cast<float>(m_swapchain.extent.width), static_cast<float>(m_swapchain.extent.height), 0, 1};
+  VkViewport vp{0.0f, 0.0f, static_cast<float>(m_swapchain.extent.width), static_cast<float>(m_swapchain.extent.height), 0.0f, 1.0f};
   VkRect2D scissor{{0, 0}, m_swapchain.extent};
   vkCmdSetViewport(cmd, 0, 1, &vp);
   vkCmdSetScissor(cmd, 0, 1, &scissor);
   vkCmdDraw(cmd, 3, 1, 0, 0);
+
+  // 6. Overlay triangle
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_trianglePipeline);
   VkDeviceSize vertexOffset = 0;
   vkCmdBindVertexBuffers(cmd, 0, 1, &m_triangleBuffer, &vertexOffset);
   vkCmdDraw(cmd, 3, 1, 0, 0);
+
   vkCmdEndRendering(cmd);
 
-  barrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-  barrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-  barrier.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
-  barrier.dstAccessMask = 0;
-  barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-  barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+  // 7. Transition swapchain image for presentation
+  VkImageMemoryBarrier2 presentBarrier{};
+  presentBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+  presentBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+  presentBarrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+  presentBarrier.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
+  presentBarrier.dstAccessMask = 0;
+  presentBarrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  presentBarrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+  presentBarrier.image = m_swapchainImages[imageIndex];
+  presentBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
-  vkCmdPipelineBarrier2(cmd, &dependency);
+  VkDependencyInfo presentDep{};
+  presentDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+  presentDep.imageMemoryBarrierCount = 1;
+  presentDep.pImageMemoryBarriers = &presentBarrier;
+  vkCmdPipelineBarrier2(cmd, &presentDep);
 
   checkVk(vkEndCommandBuffer(cmd), "end command buffer");
 }
 
-void VulkanContext::drawFrame() {
+void VulkanContext::drawFrame(float deltaTime, float totalTime) {
+  if (m_framebufferResized || m_window->isMinimized()) {
+    recreateSwapchain();
+    if (m_window->isMinimized() || m_swapchain.extent.width == 0 || m_swapchain.extent.height == 0)
+      return;
+  }
+
   auto &frame = m_frames[m_frameIndex];
   checkVk(vkWaitForFences(m_device, 1, &frame.inFlight, VK_TRUE, std::numeric_limits<uint64_t>::max()), "wait for frame fence");
+
   uint32_t imageIndex = 0;
-  VkResult result = vkAcquireNextImageKHR(m_device, m_swapchain.swapchain, std::numeric_limits<uint64_t>::max(), frame.imageAvailable, VK_NULL_HANDLE, &imageIndex);
+  VkResult result = vkAcquireNextImageKHR(m_device, m_swapchain.swapchain, std::numeric_limits<uint64_t>::max(),
+                                          frame.imageAvailable, VK_NULL_HANDLE, &imageIndex);
   if (result == VK_ERROR_OUT_OF_DATE_KHR) {
     recreateSwapchain();
     return;
   }
-  const bool acquireSuboptimal = result == VK_SUBOPTIMAL_KHR;
+  const bool acquireSuboptimal = (result == VK_SUBOPTIMAL_KHR);
   if (result != VK_SUCCESS && !acquireSuboptimal)
     checkVk(result, "acquire swapchain image");
+
   if (m_imagesInFlight[imageIndex] != VK_NULL_HANDLE && m_imagesInFlight[imageIndex] != frame.inFlight)
     checkVk(vkWaitForFences(m_device, 1, &m_imagesInFlight[imageIndex], VK_TRUE, std::numeric_limits<uint64_t>::max()), "wait for swapchain image fence");
   m_imagesInFlight[imageIndex] = frame.inFlight;
+
   checkVk(vkResetFences(m_device, 1, &frame.inFlight), "reset frame fence");
   checkVk(vkResetCommandBuffer(frame.cmd, 0), "reset command buffer");
-  recordCommands(frame, imageIndex);
-  VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-  VkSubmitInfo submit{};
-  submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-  submit.waitSemaphoreCount = 1;
-  submit.pWaitSemaphores = &frame.imageAvailable;
-  submit.pWaitDstStageMask = &waitStage;
-  submit.commandBufferCount = 1;
-  submit.pCommandBuffers = &frame.cmd;
-  submit.signalSemaphoreCount = 1;
-  submit.pSignalSemaphores = &m_renderFinished[imageIndex];
-  checkVk(vkQueueSubmit(m_graphicsQueue, 1, &submit, frame.inFlight), "submit frame");
+
+  recordCommands(frame, imageIndex, deltaTime, totalTime);
+
+  // Modern Vulkan 1.3 synchronization2 submission
+  VkSemaphoreSubmitInfo waitInfo{};
+  waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+  waitInfo.semaphore = frame.imageAvailable;
+  waitInfo.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+
+  VkCommandBufferSubmitInfo cmdInfo{};
+  cmdInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+  cmdInfo.commandBuffer = frame.cmd;
+
+  VkSemaphoreSubmitInfo signalInfo{};
+  signalInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+  signalInfo.semaphore = frame.renderFinished;
+  signalInfo.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+
+  VkSubmitInfo2 submitInfo{};
+  submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+  submitInfo.waitSemaphoreInfoCount = 1;
+  submitInfo.pWaitSemaphoreInfos = &waitInfo;
+  submitInfo.commandBufferInfoCount = 1;
+  submitInfo.pCommandBufferInfos = &cmdInfo;
+  submitInfo.signalSemaphoreInfoCount = 1;
+  submitInfo.pSignalSemaphoreInfos = &signalInfo;
+
+  checkVk(vkQueueSubmit2(m_graphicsQueue, 1, &submitInfo, frame.inFlight), "submit frame");
+
   VkPresentInfoKHR present{};
   present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
   present.waitSemaphoreCount = 1;
-  present.pWaitSemaphores = &m_renderFinished[imageIndex];
+  present.pWaitSemaphores = &frame.renderFinished;
   present.swapchainCount = 1;
   present.pSwapchains = &m_swapchain.swapchain;
   present.pImageIndices = &imageIndex;
+
   result = vkQueuePresentKHR(m_graphicsQueue, &present);
   if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR ||
-      acquireSuboptimal || m_framebufferResized)
+      acquireSuboptimal || m_framebufferResized) {
     recreateSwapchain();
-  else
+  } else {
     checkVk(result, "present frame");
+  }
+
   m_frameIndex = (m_frameIndex + 1) % kFramesInFlight;
 }
 

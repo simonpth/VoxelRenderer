@@ -97,7 +97,9 @@ if(VOXEL_ENABLE_TRACY)
 	FetchContent_MakeAvailable(tracy)
 endif()
 
-set(SLANG_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/triangle.slang")
+set(COMPUTE_SLANG_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/compute.slang")
+set(FULLSCREEN_SLANG_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/fullscreen.slang")
+set(OVERLAY_SLANG_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/overlay.slang")
 set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
 set(VERTEX_SHADER "${SHADER_OUTPUT_DIR}/triangle.vert.spv")
 set(FRAGMENT_SHADER "${SHADER_OUTPUT_DIR}/triangle.frag.spv")
@@ -110,40 +112,40 @@ if(VOXEL_ENABLE_SLANG)
 		OUTPUT "${VERTEX_SHADER}"
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUTPUT_DIR}"
 		COMMAND "${SLANGC_EXECUTABLE}" -target spirv -profile spirv_1_3
-			-entry vertexMain -stage vertex -o "${VERTEX_SHADER}" "${SLANG_SOURCE}"
-		DEPENDS "${SLANG_SOURCE}"
+			-entry vertexMain -stage vertex -o "${VERTEX_SHADER}" "${FULLSCREEN_SLANG_SOURCE}"
+		DEPENDS "${FULLSCREEN_SLANG_SOURCE}"
 		VERBATIM
 	)
 	add_custom_command(
 		OUTPUT "${FRAGMENT_SHADER}"
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUTPUT_DIR}"
 		COMMAND "${SLANGC_EXECUTABLE}" -target spirv -profile spirv_1_3
-			-entry fragmentMain -stage fragment -o "${FRAGMENT_SHADER}" "${SLANG_SOURCE}"
-		DEPENDS "${SLANG_SOURCE}"
+			-entry fragmentMain -stage fragment -o "${FRAGMENT_SHADER}" "${FULLSCREEN_SLANG_SOURCE}"
+		DEPENDS "${FULLSCREEN_SLANG_SOURCE}"
 		VERBATIM
 	)
 	add_custom_command(
 		OUTPUT "${COMPUTE_SHADER}"
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUTPUT_DIR}"
 		COMMAND "${SLANGC_EXECUTABLE}" -target spirv -profile spirv_1_3
-			-entry computeMain -stage compute -o "${COMPUTE_SHADER}" "${SLANG_SOURCE}"
-		DEPENDS "${SLANG_SOURCE}"
+			-entry computeMain -stage compute -o "${COMPUTE_SHADER}" "${COMPUTE_SLANG_SOURCE}"
+		DEPENDS "${COMPUTE_SLANG_SOURCE}"
 		VERBATIM
 	)
 	add_custom_command(
 		OUTPUT "${OVERLAY_VERTEX_SHADER}"
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUTPUT_DIR}"
 		COMMAND "${SLANGC_EXECUTABLE}" -target spirv -profile spirv_1_3
-			-entry overlayVertexMain -stage vertex -o "${OVERLAY_VERTEX_SHADER}" "${SLANG_SOURCE}"
-		DEPENDS "${SLANG_SOURCE}"
+			-entry overlayVertexMain -stage vertex -o "${OVERLAY_VERTEX_SHADER}" "${OVERLAY_SLANG_SOURCE}"
+		DEPENDS "${OVERLAY_SLANG_SOURCE}"
 		VERBATIM
 	)
 	add_custom_command(
 		OUTPUT "${OVERLAY_FRAGMENT_SHADER}"
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUTPUT_DIR}"
 		COMMAND "${SLANGC_EXECUTABLE}" -target spirv -profile spirv_1_3
-			-entry overlayFragmentMain -stage fragment -o "${OVERLAY_FRAGMENT_SHADER}" "${SLANG_SOURCE}"
-		DEPENDS "${SLANG_SOURCE}"
+			-entry overlayFragmentMain -stage fragment -o "${OVERLAY_FRAGMENT_SHADER}" "${OVERLAY_SLANG_SOURCE}"
+		DEPENDS "${OVERLAY_SLANG_SOURCE}"
 		VERBATIM
 	)
 else()
@@ -177,7 +179,7 @@ target_link_libraries(VoxelRenderer PRIVATE
 
 target_compile_definitions(VoxelRenderer PRIVATE
 	GLM_FORCE_RADIANS
-	GLM_FORCE_DEPTH_ZERO_T‚O_ONE
+	GLM_FORCE_DEPTH_ZERO_TO_ONE
 	VULKAN_HPP_NO_CONSTRUCTORS
 	VOXEL_SHADER_DIR="${SHADER_OUTPUT_DIR}/"
 )

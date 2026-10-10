@@ -30,7 +30,7 @@
 #include "window.hpp"
 
 #ifndef VOXEL_SHADER_DIR
-#define VOXEL_SHADER_DIR "/Users/simonpth/proj/VoxelRenderer/build/shaders/"
+#define VOXEL_SHADER_DIR "shaders/"
 #endif
 
 class VulkanContext {
@@ -42,32 +42,40 @@ public:
     VulkanContext& operator=(const VulkanContext&) = delete;
 
     // Call once per frame. Renders everything and presents.
-    void drawFrame();
+    void drawFrame(float deltaTime = 0.0f, float totalTime = 0.0f);
 
-    // Call from the GLFW framebuffer-size callback (optional; out-of-date swapchains are also detected).
+    // Call from resize event.
     void notifyResized() { m_framebufferResized = true; }
 
 private:
     static constexpr uint32_t kFramesInFlight = 2;
 
-    static constexpr const char* vertexShaderPath   = VOXEL_SHADER_DIR "triangle.vert.spv";
-    static constexpr const char* fragmentShaderPath = VOXEL_SHADER_DIR "triangle.frag.spv";
-    static constexpr const char* computeShaderPath = VOXEL_SHADER_DIR "pixel.comp.spv";
-    static constexpr const char* overlayVertexShaderPath = VOXEL_SHADER_DIR "overlay.vert.spv";
+    static constexpr const char* vertexShaderPath          = VOXEL_SHADER_DIR "triangle.vert.spv";
+    static constexpr const char* fragmentShaderPath        = VOXEL_SHADER_DIR "triangle.frag.spv";
+    static constexpr const char* computeShaderPath         = VOXEL_SHADER_DIR "pixel.comp.spv";
+    static constexpr const char* overlayVertexShaderPath   = VOXEL_SHADER_DIR "overlay.vert.spv";
     static constexpr const char* overlayFragmentShaderPath = VOXEL_SHADER_DIR "overlay.frag.spv";
 
     struct Vertex { float pos[2]; float color[3]; };
 
+    struct ComputePushConstants {
+        uint32_t width     = 0;
+        uint32_t height    = 0;
+        float    time      = 0.0f;
+        float    deltaTime = 0.0f;
+    };
+
     struct FrameData {
-        VkCommandPool   pool           = VK_NULL_HANDLE;
-        VkCommandBuffer cmd            = VK_NULL_HANDLE;
-        VkSemaphore     imageAvailable = VK_NULL_HANDLE;
-        VkFence         inFlight       = VK_NULL_HANDLE;
-        VkImage computeImage = VK_NULL_HANDLE;
-        VmaAllocation computeAllocation = VK_NULL_HANDLE;
-        VkImageView computeImageView = VK_NULL_HANDLE;
-        VkDescriptorSet computeDescriptorSet = VK_NULL_HANDLE;
-        bool computeImageInitialized = false;
+        VkCommandPool   pool                    = VK_NULL_HANDLE;
+        VkCommandBuffer cmd                     = VK_NULL_HANDLE;
+        VkSemaphore     imageAvailable          = VK_NULL_HANDLE;
+        VkSemaphore     renderFinished          = VK_NULL_HANDLE;
+        VkFence         inFlight                = VK_NULL_HANDLE;
+        VkImage         computeImage            = VK_NULL_HANDLE;
+        VmaAllocation   computeAllocation       = VK_NULL_HANDLE;
+        VkImageView     computeImageView        = VK_NULL_HANDLE;
+        VkDescriptorSet computeDescriptorSet    = VK_NULL_HANDLE;
+        bool            computeImageInitialized = false;
     };
 
     // --- init ---
@@ -76,15 +84,18 @@ private:
     void initAllocator();
     void createSwapchain();
     void createFrameResources();
-    void createPipeline();
-    void createComputeResources();
-    void destroyComputeResources();
+    void createDescriptorSetLayout();
+    void createPipelineLayout();
+    void createPipelines();
+    void createDescriptorPool();
+    void createComputeImages();
+    void destroyComputeImages();
     void createTriangleBuffer();
 
     // --- runtime ---
     void cleanupSwapchain();
     void recreateSwapchain();
-    void recordCommands(FrameData& frame, uint32_t imageIndex);
+    void recordCommands(FrameData& frame, uint32_t imageIndex, float deltaTime, float totalTime);
 
     // --- helpers ---
     VkShaderModule createShaderModule(const std::string& path);
@@ -109,22 +120,20 @@ private:
     // Swapchain-dependent
     std::vector<VkImage>     m_swapchainImages;
     std::vector<VkImageView> m_swapchainImageViews;
-    std::vector<VkSemaphore> m_renderFinished; // one per swapchain image
     std::vector<VkFence>     m_imagesInFlight; // fence currently using each image
 
     // Per-frame
     std::array<FrameData, kFramesInFlight> m_frames{};
     uint32_t m_frameIndex = 0;
 
-    // Pipeline
-    VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
-    VkPipeline       m_pipeline       = VK_NULL_HANDLE;
-    VkPipeline m_trianglePipeline = VK_NULL_HANDLE;
+    // Pipelines and Descriptors (persistent across swapchain recreations)
     VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
-    VkPipelineLayout m_computePipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_computePipeline = VK_NULL_HANDLE;
-    VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
-    // A compute target per in-flight frame prevents read/write hazards across submissions.
+    VkPipelineLayout      m_pipelineLayout      = VK_NULL_HANDLE;
+    VkPipeline            m_computePipeline     = VK_NULL_HANDLE;
+    VkPipeline            m_pipeline            = VK_NULL_HANDLE;
+    VkPipeline            m_trianglePipeline    = VK_NULL_HANDLE;
+    VkDescriptorPool      m_descriptorPool      = VK_NULL_HANDLE;
+
     VkFormat m_computeImageFormat = VK_FORMAT_R8G8B8A8_UNORM;
     VkBuffer m_triangleBuffer = VK_NULL_HANDLE;
     VmaAllocation m_triangleAllocation = VK_NULL_HANDLE;
