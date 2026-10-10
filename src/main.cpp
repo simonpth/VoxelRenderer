@@ -34,7 +34,7 @@ int main() {
         }
 
         player.update(deltaTime);
-        renderer.drawFrame(deltaTime, totalTime);
+        renderer.drawFrame(deltaTime, totalTime, player.getHealth() / player.getMaxHealth());
 
         ++fpsFrameCount;
         const std::chrono::duration<float> fpsElapsed = currentFrameTime - fpsWindowStart;

@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "window.hpp"
+#include "ui.hpp"
 
 #ifndef VOXEL_SHADER_DIR
 #define VOXEL_SHADER_DIR "shaders/"
@@ -42,10 +43,12 @@ public:
     VulkanContext& operator=(const VulkanContext&) = delete;
 
     // Call once per frame. Renders everything and presents.
-    void drawFrame(float deltaTime = 0.0f, float totalTime = 0.0f);
+    void drawFrame(float deltaTime = 0.0f, float totalTime = 0.0f, float health = 0.85f);
 
     // Call from resize event.
     void notifyResized() { m_framebufferResized = true; }
+
+    UI& getUI() { return m_ui; }
 
 private:
     static constexpr uint32_t kFramesInFlight = 2;
@@ -55,8 +58,6 @@ private:
     static constexpr const char* computeShaderPath         = VOXEL_SHADER_DIR "pixel.comp.spv";
     static constexpr const char* overlayVertexShaderPath   = VOXEL_SHADER_DIR "overlay.vert.spv";
     static constexpr const char* overlayFragmentShaderPath = VOXEL_SHADER_DIR "overlay.frag.spv";
-
-    struct Vertex { float pos[2]; float color[3]; };
 
     struct ComputePushConstants {
         uint32_t width     = 0;
@@ -76,6 +77,12 @@ private:
         VkImageView     computeImageView        = VK_NULL_HANDLE;
         VkDescriptorSet computeDescriptorSet    = VK_NULL_HANDLE;
         bool            computeImageInitialized = false;
+
+        VkBuffer        overlayVertexBuffer     = VK_NULL_HANDLE;
+        VmaAllocation   overlayVertexAllocation = VK_NULL_HANDLE;
+        void*           overlayMappedData       = nullptr;
+        uint32_t        overlayVertexCount      = 0;
+        size_t          overlayBufferCapacity   = 0;
     };
 
     // --- init ---
@@ -90,7 +97,7 @@ private:
     void createDescriptorPool();
     void createComputeImages();
     void destroyComputeImages();
-    void createTriangleBuffer();
+    void updateOverlayBuffer(FrameData& frame, const std::vector<OverlayVertex>& vertices);
 
     // --- runtime ---
     void cleanupSwapchain();
@@ -131,12 +138,13 @@ private:
     VkPipelineLayout      m_pipelineLayout      = VK_NULL_HANDLE;
     VkPipeline            m_computePipeline     = VK_NULL_HANDLE;
     VkPipeline            m_pipeline            = VK_NULL_HANDLE;
-    VkPipeline            m_trianglePipeline    = VK_NULL_HANDLE;
+    VkPipeline            m_overlayPipeline     = VK_NULL_HANDLE;
     VkDescriptorPool      m_descriptorPool      = VK_NULL_HANDLE;
 
     VkFormat m_computeImageFormat = VK_FORMAT_R8G8B8A8_UNORM;
-    VkBuffer m_triangleBuffer = VK_NULL_HANDLE;
-    VmaAllocation m_triangleAllocation = VK_NULL_HANDLE;
+
+    UI m_ui;
+    float m_rollingFps = 60.0f;
 
     bool m_framebufferResized = false;
 };

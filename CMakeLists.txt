@@ -77,13 +77,46 @@ FetchContent_Declare(
 	GIT_SHALLOW TRUE
 )
 
+FetchContent_Declare(
+	clay
+	GIT_REPOSITORY https://github.com/nicbarker/clay.git
+	GIT_TAG v0.14
+	GIT_SHALLOW TRUE
+)
+
+FetchContent_Declare(
+	stb
+	GIT_REPOSITORY https://github.com/nothings/stb.git
+	GIT_TAG 2c980bb59875b0d32144a71867fbdebb2f77cd20
+	GIT_SHALLOW TRUE
+)
+
+set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL "" FORCE)
+set(CLAY_INCLUDE_ALL_EXAMPLES OFF CACHE BOOL "" FORCE)
+
 FetchContent_MakeAvailable(
 	SDL3
 	volk
 	vk_bootstrap
 	VulkanMemoryAllocator
 	glm
+	clay
 )
+
+if(NOT TARGET clay)
+	add_library(clay INTERFACE)
+	target_include_directories(clay INTERFACE "${clay_SOURCE_DIR}")
+endif()
+
+FetchContent_GetProperties(stb)
+if(NOT stb_POPULATED)
+	if(POLICY CMP0169)
+		cmake_policy(SET CMP0169 OLD)
+	endif()
+	FetchContent_Populate(stb)
+	add_library(stb INTERFACE)
+	target_include_directories(stb INTERFACE "${stb_SOURCE_DIR}")
+endif()
 
 if(VOXEL_ENABLE_TRACY)
 	set(TRACY_ENABLE ON CACHE BOOL "" FORCE)
@@ -155,7 +188,8 @@ endif()
 add_executable(VoxelRenderer
 	src/main.cpp
 	src/renderer/vulkancontext.cpp
-  src/engine/player.cpp
+	src/renderer/ui.cpp
+	src/engine/player.cpp
 	"${VERTEX_SHADER}"
 	"${FRAGMENT_SHADER}"
 	"${COMPUTE_SHADER}"
@@ -174,6 +208,8 @@ target_link_libraries(VoxelRenderer PRIVATE
 	vk-bootstrap::vk-bootstrap
 	GPUOpen::VulkanMemoryAllocator
 	glm::glm
+	clay
+	stb
 )
 
 

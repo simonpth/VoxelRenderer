@@ -20,9 +20,13 @@ public:
   float getYaw() const { return m_yaw; }
   float getPitch() const { return m_pitch; }
   float getMovementSpeed() const { return m_movementSpeed; }
+  float getHealth() const { return m_health; }
+  float getMaxHealth() const { return m_maxHealth; }
 
   void setPosition(const glm::vec3 &position) { m_position = position; }
   void setMovementSpeed(float speed) { m_movementSpeed = speed; }
+  void setHealth(float health) { m_health = health; }
+  void setMaxHealth(float maxHealth) { m_maxHealth = maxHealth; }
 
 private:
   glm::vec3 m_position{0.0f, 0.0f, 2.0f};
@@ -31,4 +35,6 @@ private:
   float m_yaw{-90.0f};
   float m_pitch{0.0f};
   float m_movementSpeed{5.0f};
+  float m_health{85.0f};
+  float m_maxHealth{100.0f};
 };

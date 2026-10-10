@@ -48,22 +48,27 @@ VulkanContext::VulkanContext(Window *window) : m_window(window) {
   createPipelines();
   createDescriptorPool();
   createComputeImages();
-  createTriangleBuffer();
 }
 
 VulkanContext::~VulkanContext() {
   if (m_device)
     vkDeviceWaitIdle(m_device);
 
-  if (m_allocator && m_triangleBuffer)
-    vmaDestroyBuffer(m_allocator, m_triangleBuffer, m_triangleAllocation);
+  for (auto &frame : m_frames) {
+    if (frame.overlayVertexBuffer) {
+      vmaDestroyBuffer(m_allocator, frame.overlayVertexBuffer, frame.overlayVertexAllocation);
+      frame.overlayVertexBuffer = VK_NULL_HANDLE;
+      frame.overlayVertexAllocation = VK_NULL_HANDLE;
+      frame.overlayMappedData = nullptr;
+    }
+  }
 
   if (m_computePipeline)
     vkDestroyPipeline(m_device, m_computePipeline, nullptr);
   if (m_pipeline)
     vkDestroyPipeline(m_device, m_pipeline, nullptr);
-  if (m_trianglePipeline)
-    vkDestroyPipeline(m_device, m_trianglePipeline, nullptr);
+  if (m_overlayPipeline)
+    vkDestroyPipeline(m_device, m_overlayPipeline, nullptr);
   if (m_pipelineLayout)
     vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
 
@@ -323,17 +328,17 @@ void VulkanContext::createPipelines() {
     vkDestroyShaderModule(m_device, vertexShader, nullptr);
     vkDestroyShaderModule(m_device, fragmentShader, nullptr);
 
-    // 3. Triangle overlay graphics pipeline
+    // 3. UI overlay graphics pipeline
     VkShaderModule overlayVertex = createShaderModule(overlayVertexShaderPath);
     VkShaderModule overlayFragment = createShaderModule(overlayFragmentShaderPath);
     VkPipelineShaderStageCreateInfo overlayStages[2]{};
     overlayStages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, overlayVertex, "main", nullptr};
     overlayStages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, overlayFragment, "main", nullptr};
 
-    VkVertexInputBindingDescription binding{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputBindingDescription binding{0, sizeof(OverlayVertex), VK_VERTEX_INPUT_RATE_VERTEX};
     VkVertexInputAttributeDescription attributes[] = {
-        {0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, pos)},
-        {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, color)}
+        {0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(OverlayVertex, pos)},
+        {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(OverlayVertex, color)}
     };
     vertexInput.vertexBindingDescriptionCount = 1;
     vertexInput.pVertexBindingDescriptions = &binding;
@@ -341,7 +346,24 @@ void VulkanContext::createPipelines() {
     vertexInput.pVertexAttributeDescriptions = attributes;
     pipelineInfo.pStages = overlayStages;
 
-    checkVk(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_trianglePipeline), "create triangle overlay pipeline");
+    VkPipelineColorBlendAttachmentState overlayBlendAttachment{};
+    overlayBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    overlayBlendAttachment.blendEnable = VK_TRUE;
+    overlayBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    overlayBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    overlayBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+    overlayBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    overlayBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    overlayBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+
+    VkPipelineColorBlendStateCreateInfo overlayBlend{};
+    overlayBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    overlayBlend.attachmentCount = 1;
+    overlayBlend.pAttachments = &overlayBlendAttachment;
+    pipelineInfo.pColorBlendState = &overlayBlend;
+
+    checkVk(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_overlayPipeline), "create overlay pipeline");
     vkDestroyShaderModule(m_device, overlayVertex, nullptr);
     vkDestroyShaderModule(m_device, overlayFragment, nullptr);
   }
@@ -440,26 +462,41 @@ void VulkanContext::destroyComputeImages() {
   }
 }
 
-void VulkanContext::createTriangleBuffer() {
-  const Vertex vertices[] = {
-      {{0.0f, -0.5f}, {1.0f, 0.0f, 0.0f}},
-      {{0.5f, 0.5f}, {0.0f, 1.0f, 0.0f}},
-      {{-0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}}
-  };
+void VulkanContext::updateOverlayBuffer(FrameData& frame, const std::vector<OverlayVertex>& vertices) {
+  if (vertices.empty()) {
+    frame.overlayVertexCount = 0;
+    return;
+  }
 
-  VkBufferCreateInfo bufferInfo{};
-  bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-  bufferInfo.size = sizeof(vertices);
-  bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+  const size_t requiredBytes = vertices.size() * sizeof(OverlayVertex);
+  if (frame.overlayBufferCapacity < requiredBytes) {
+    if (frame.overlayVertexBuffer) {
+      vmaDestroyBuffer(m_allocator, frame.overlayVertexBuffer, frame.overlayVertexAllocation);
+      frame.overlayVertexBuffer = VK_NULL_HANDLE;
+      frame.overlayVertexAllocation = VK_NULL_HANDLE;
+      frame.overlayMappedData = nullptr;
+    }
 
-  VmaAllocationCreateInfo allocationInfo{};
-  allocationInfo.usage = VMA_MEMORY_USAGE_AUTO;
-  allocationInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    const size_t newCapacity = std::max(requiredBytes * 2, size_t{16384 * sizeof(OverlayVertex)});
 
-  VmaAllocationInfo mapped{};
-  checkVk(vmaCreateBuffer(m_allocator, &bufferInfo, &allocationInfo, &m_triangleBuffer, &m_triangleAllocation, &mapped), "create triangle buffer");
-  std::memcpy(mapped.pMappedData, vertices, sizeof(vertices));
-  vmaFlushAllocation(m_allocator, m_triangleAllocation, 0, sizeof(vertices));
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = newCapacity;
+    bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+
+    VmaAllocationCreateInfo allocationInfo{};
+    allocationInfo.usage = VMA_MEMORY_USAGE_AUTO;
+    allocationInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+    VmaAllocationInfo mapped{};
+    checkVk(vmaCreateBuffer(m_allocator, &bufferInfo, &allocationInfo, &frame.overlayVertexBuffer, &frame.overlayVertexAllocation, &mapped), "create overlay vertex buffer");
+    frame.overlayMappedData = mapped.pMappedData;
+    frame.overlayBufferCapacity = newCapacity;
+  }
+
+  std::memcpy(frame.overlayMappedData, vertices.data(), requiredBytes);
+  vmaFlushAllocation(m_allocator, frame.overlayVertexAllocation, 0, requiredBytes);
+  frame.overlayVertexCount = static_cast<uint32_t>(vertices.size());
 }
 
 void VulkanContext::cleanupSwapchain() {
@@ -575,11 +612,13 @@ void VulkanContext::recordCommands(FrameData &frame, uint32_t imageIndex, float 
   vkCmdSetScissor(cmd, 0, 1, &scissor);
   vkCmdDraw(cmd, 3, 1, 0, 0);
 
-  // 6. Overlay triangle
-  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_trianglePipeline);
-  VkDeviceSize vertexOffset = 0;
-  vkCmdBindVertexBuffers(cmd, 0, 1, &m_triangleBuffer, &vertexOffset);
-  vkCmdDraw(cmd, 3, 1, 0, 0);
+  // 6. UI Overlay
+  if (frame.overlayVertexCount > 0) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_overlayPipeline);
+    VkDeviceSize vertexOffset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &frame.overlayVertexBuffer, &vertexOffset);
+    vkCmdDraw(cmd, frame.overlayVertexCount, 1, 0, 0);
+  }
 
   vkCmdEndRendering(cmd);
 
@@ -604,7 +643,7 @@ void VulkanContext::recordCommands(FrameData &frame, uint32_t imageIndex, float 
   checkVk(vkEndCommandBuffer(cmd), "end command buffer");
 }
 
-void VulkanContext::drawFrame(float deltaTime, float totalTime) {
+void VulkanContext::drawFrame(float deltaTime, float totalTime, float health) {
   if (m_framebufferResized || m_window->isMinimized()) {
     recreateSwapchain();
     if (m_window->isMinimized() || m_swapchain.extent.width == 0 || m_swapchain.extent.height == 0)
@@ -631,6 +670,13 @@ void VulkanContext::drawFrame(float deltaTime, float totalTime) {
 
   checkVk(vkResetFences(m_device, 1, &frame.inFlight), "reset frame fence");
   checkVk(vkResetCommandBuffer(frame.cmd, 0), "reset command buffer");
+
+  if (deltaTime > 0.00001f) {
+    float instantFps = 1.0f / deltaTime;
+    m_rollingFps = 0.95f * m_rollingFps + 0.05f * instantFps;
+  }
+  m_ui.update({ health, m_rollingFps }, m_swapchain.extent.width, m_swapchain.extent.height);
+  updateOverlayBuffer(frame, m_ui.getVertices());
 
   recordCommands(frame, imageIndex, deltaTime, totalTime);
 
