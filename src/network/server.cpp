@@ -28,6 +28,7 @@ void Server::receive() {
         std::scoped_lock lock(m_mutex);
         if (intent.clientTick > m_lastClientTick || peer != m_peer) {
             if (peer != m_peer) m_worldSent = false;
+            m_jumpRequested = m_jumpRequested || intent.jumpPressed;
             m_latest = intent; m_lastClientTick = intent.clientTick; m_peer = std::move(peer);
         }
     }
@@ -45,6 +46,8 @@ void Server::run() {
             {
                 std::scoped_lock lock(m_mutex);
                 intent = m_latest; peer = m_peer;
+                intent.jumpPressed = m_jumpRequested;
+                m_jumpRequested = false;
             }
             if (intent.clientTick <= m_authority.state().acknowledgedInputTick) {
                 intent = {};

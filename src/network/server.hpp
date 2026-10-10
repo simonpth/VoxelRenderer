@@ -26,6 +26,7 @@ private:
     Authority m_authority{1};
     std::mutex m_mutex;
     InputIntent m_latest{};
+    bool m_jumpRequested = false;
     std::uint32_t m_lastClientTick = 0;
     Peer m_peer{};
     bool m_worldSent = false;

@@ -40,5 +40,16 @@ private:
     float m_localYaw = -90.0f;
     float m_localPitch = 0.0f;
     glm::vec3 m_localHorizontalMovement{0.0f};
+    glm::vec3 m_interpolatingHorizontalMovement{0.0f};
+    glm::vec2 m_accumulatedHorizontalMovement{0.0f};
+    glm::vec2 m_accumulatedLook{0.0f};
+    std::uint32_t m_latestClientTick = 0;
+    bool m_jumpRequested = false;
+    bool m_initialInputSent = false;
+    struct PendingMovement {
+        std::uint32_t clientTick = 0;
+        glm::vec3 displacement{0.0f};
+    };
+    std::deque<PendingMovement> m_pendingMovement;
 };
 }

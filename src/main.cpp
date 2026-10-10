@@ -19,10 +19,8 @@ int main() {
 
     using Clock = std::chrono::steady_clock;
     auto lastFrameTime = Clock::now();
-    auto serverDebugPrintTime = lastFrameTime;
     float totalTime = 0.0f;
     std::uint32_t inputTick = 1;
-    bool jumpWasDown = false;
     glm::vec2 mouseDelta{0.0f};
 
     // Main Rendering loop
@@ -69,25 +67,11 @@ int main() {
             input.look.y = -mouseDelta.y * mouseSensitivity;
         }
         const bool jumpDown = keyboard[SDL_SCANCODE_SPACE];
-        input.jumpPressed = jumpDown && !jumpWasDown;
-        jumpWasDown = jumpDown;
+        input.jumpPressed = jumpDown;
         client.submit(input, deltaTime);
         client.updateRender(deltaTime);
         const voxel::RenderState& renderState = client.renderState();
-        const voxel::AuthoritativeState& authoritative = client.authoritativeState();
         renderer.drawFrame(deltaTime, totalTime, renderState);
-
-        const std::chrono::duration<float> serverDebugElapsed =
-            currentFrameTime - serverDebugPrintTime;
-        if (serverDebugElapsed.count() >= 1.0f) {
-            const glm::vec3& position = authoritative.localPlayer.position;
-            std::cout << "Server player position: "
-                      << position.x << ", "
-                      << position.y << ", "
-                      << position.z << '\n';
-            serverDebugPrintTime = currentFrameTime;
-        }
-
     }
 
     return 0;
