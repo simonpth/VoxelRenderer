@@ -1,22 +1,29 @@
 #include <iostream>
 #include <chrono>
-#include <iomanip>
 #include "renderer/window.hpp"
 #include "renderer/vulkancontext.hpp"
-#include "engine/player.hpp"
+#include "network/client.hpp"
+#include "network/server.hpp"
 
 int main() {
     std::cout << "Voxel Renderer started." << std::endl;
 
     Window window("Voxel Renderer", 800, 600);
     VulkanContext renderer(&window);
-    Player player;
+    voxel::net::Server server;
+    voxel::net::Client client;
+    server.start();
+    client.start();
+    bool mouseLookActive = true;
+    SDL_SetWindowRelativeMouseMode(window.handle(), mouseLookActive);
 
     using Clock = std::chrono::steady_clock;
     auto lastFrameTime = Clock::now();
-    auto fpsWindowStart = lastFrameTime;
-    uint32_t fpsFrameCount = 0;
+    auto serverDebugPrintTime = lastFrameTime;
     float totalTime = 0.0f;
+    std::uint32_t inputTick = 1;
+    bool jumpWasDown = false;
+    glm::vec2 mouseDelta{0.0f};
 
     // Main Rendering loop
     while (!window.shouldClose()) {
@@ -26,24 +33,61 @@ int main() {
         const float deltaTime = deltaDuration.count();
         totalTime += deltaTime;
 
-        window.pollEvents();
+        mouseDelta = {0.0f, 0.0f};
+        window.pollEvents([&](const SDL_Event& event) {
+            if (event.type == SDL_EVENT_KEY_DOWN &&
+                event.key.scancode == SDL_SCANCODE_ESCAPE &&
+                !event.key.repeat) {
+                mouseLookActive = false;
+                SDL_SetWindowRelativeMouseMode(window.handle(), false);
+            } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
+                       event.button.button == SDL_BUTTON_LEFT) {
+                mouseLookActive = true;
+                SDL_SetWindowRelativeMouseMode(window.handle(), true);
+            }
+            if (event.type == SDL_EVENT_MOUSE_MOTION) {
+                mouseDelta.x += event.motion.xrel;
+                mouseDelta.y += event.motion.yrel;
+            }
+        });
 
         if (window.wasResized()) {
             window.waitWhileMinimized();
             renderer.notifyResized();
         }
 
-        player.update(deltaTime);
-        renderer.drawFrame(deltaTime, totalTime, player.getHealth() / player.getMaxHealth());
-
-        ++fpsFrameCount;
-        const std::chrono::duration<float> fpsElapsed = currentFrameTime - fpsWindowStart;
-        if (fpsElapsed.count() >= 1.0f) {
-            std::cout << "FPS: " << std::fixed << std::setprecision(1)
-                      << (fpsFrameCount / fpsElapsed.count()) << '\n';
-            fpsFrameCount = 0;
-            fpsWindowStart = currentFrameTime;
+        const bool* keyboard = SDL_GetKeyboardState(nullptr);
+        voxel::InputIntent input{};
+        input.clientTick = inputTick++;
+        input.move.x = static_cast<float>(keyboard[SDL_SCANCODE_D]) -
+                       static_cast<float>(keyboard[SDL_SCANCODE_A]);
+        input.move.y = static_cast<float>(keyboard[SDL_SCANCODE_W]) -
+                       static_cast<float>(keyboard[SDL_SCANCODE_S]);
+        constexpr float mouseSensitivity = 0.12f;
+        if (mouseLookActive) {
+            input.look.x = mouseDelta.x * mouseSensitivity;
+            input.look.y = -mouseDelta.y * mouseSensitivity;
         }
+        const bool jumpDown = keyboard[SDL_SCANCODE_SPACE];
+        input.jumpPressed = jumpDown && !jumpWasDown;
+        jumpWasDown = jumpDown;
+        client.submit(input, deltaTime);
+        client.updateRender(deltaTime);
+        const voxel::RenderState& renderState = client.renderState();
+        const voxel::AuthoritativeState& authoritative = client.authoritativeState();
+        renderer.drawFrame(deltaTime, totalTime, renderState);
+
+        const std::chrono::duration<float> serverDebugElapsed =
+            currentFrameTime - serverDebugPrintTime;
+        if (serverDebugElapsed.count() >= 1.0f) {
+            const glm::vec3& position = authoritative.localPlayer.position;
+            std::cout << "Server player position: "
+                      << position.x << ", "
+                      << position.y << ", "
+                      << position.z << '\n';
+            serverDebugPrintTime = currentFrameTime;
+        }
+
     }
 
     return 0;

@@ -7,6 +7,8 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <cmath>
+#include <format>
 
 namespace {
 void checkVk(VkResult result, const char *operation) {
@@ -47,6 +49,7 @@ VulkanContext::VulkanContext(Window *window) : m_window(window) {
   createPipelineLayout();
   createPipelines();
   createDescriptorPool();
+  createWorldBuffer();
   createComputeImages();
 }
 
@@ -73,6 +76,7 @@ VulkanContext::~VulkanContext() {
     vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
 
   destroyComputeImages();
+  destroyWorldBuffer();
 
   if (m_descriptorPool)
     vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
@@ -214,13 +218,14 @@ void VulkanContext::createFrameResources() {
 }
 
 void VulkanContext::createDescriptorSetLayout() {
-  VkDescriptorSetLayoutBinding bindings[2]{};
+  VkDescriptorSetLayoutBinding bindings[3]{};
   bindings[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
   bindings[1] = {1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+  bindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 
   VkDescriptorSetLayoutCreateInfo setInfo{};
   setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  setInfo.bindingCount = 2;
+  setInfo.bindingCount = 3;
   setInfo.pBindings = bindings;
   checkVk(vkCreateDescriptorSetLayout(m_device, &setInfo, nullptr, &m_descriptorSetLayout), "create descriptor set layout");
 }
@@ -372,13 +377,14 @@ void VulkanContext::createPipelines() {
 void VulkanContext::createDescriptorPool() {
   VkDescriptorPoolSize poolSizes[] = {
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kFramesInFlight},
-      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kFramesInFlight}
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kFramesInFlight}
   };
 
   VkDescriptorPoolCreateInfo poolInfo{};
   poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   poolInfo.maxSets = kFramesInFlight;
-  poolInfo.poolSizeCount = 2;
+  poolInfo.poolSizeCount = 3;
   poolInfo.pPoolSizes = poolSizes;
   checkVk(vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_descriptorPool), "create descriptor pool");
 
@@ -394,6 +400,63 @@ void VulkanContext::createDescriptorPool() {
 
   for (uint32_t i = 0; i < kFramesInFlight; ++i) {
     m_frames[i].computeDescriptorSet = descriptorSets[i];
+  }
+}
+
+void VulkanContext::createWorldBuffer() {
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = sizeof(m_uploadedWorld);
+    bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo allocationInfo{};
+    allocationInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+    allocationInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                           VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    checkVk(vmaCreateBuffer(m_allocator, &bufferInfo, &allocationInfo, &m_worldBuffer,
+                            &m_worldAllocation, nullptr), "create world buffer");
+    VmaAllocationInfo allocation{};
+    vmaGetAllocationInfo(m_allocator, m_worldAllocation, &allocation);
+    m_worldMappedData = allocation.pMappedData;
+
+    for (auto& frame : m_frames) {
+      VkDescriptorBufferInfo worldInfo{m_worldBuffer, 0, sizeof(m_uploadedWorld)};
+      VkWriteDescriptorSet write{};
+      write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      write.dstSet = frame.computeDescriptorSet;
+      write.dstBinding = 2;
+      write.descriptorCount = 1;
+      write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      write.pBufferInfo = &worldInfo;
+      vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
+    }
+  }
+
+void VulkanContext::destroyWorldBuffer() {
+    if (m_worldBuffer) {
+      vmaDestroyBuffer(m_allocator, m_worldBuffer, m_worldAllocation);
+      m_worldBuffer = VK_NULL_HANDLE;
+      m_worldAllocation = VK_NULL_HANDLE;
+      m_worldMappedData = nullptr;
+    }
+  }
+
+void VulkanContext::uploadWorld(const voxel::RenderState& state) {
+    std::array<std::uint32_t, voxel::kVoxelCount * 2> packed{};
+    for (std::size_t i = 0; i < voxel::kVoxelCount; ++i) {
+      const auto& voxel = state.world[i];
+      packed[i * 2] = voxel.material;
+      packed[i * 2 + 1] = static_cast<std::uint32_t>(voxel.color.r) |
+                          (static_cast<std::uint32_t>(voxel.color.g) << 8u) |
+                          (static_cast<std::uint32_t>(voxel.color.b) << 16u) |
+                          (static_cast<std::uint32_t>(voxel.color.a) << 24u);
+    }
+    if (!m_worldUploaded || packed != m_uploadedWorld) {
+      std::memcpy(m_worldMappedData, packed.data(), sizeof(packed));
+      m_uploadedWorld = packed;
+      m_worldUploaded = true;
+      vmaFlushAllocation(m_allocator, m_worldAllocation, 0, sizeof(packed));
   }
 }
 
@@ -518,7 +581,8 @@ void VulkanContext::recreateSwapchain() {
   m_framebufferResized = false;
 }
 
-void VulkanContext::recordCommands(FrameData &frame, uint32_t imageIndex, float deltaTime, float totalTime) {
+void VulkanContext::recordCommands(FrameData &frame, uint32_t imageIndex, float deltaTime,
+                                   float totalTime, const voxel::RenderState& state) {
   VkCommandBuffer cmd = frame.cmd;
   VkCommandBufferBeginInfo begin{};
   begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -551,7 +615,16 @@ void VulkanContext::recordCommands(FrameData &frame, uint32_t imageIndex, float 
       m_swapchain.extent.width,
       m_swapchain.extent.height,
       totalTime,
-      deltaTime
+      deltaTime,
+      // Authoritative position is the player's feet; render from eye height.
+      glm::vec4(state.localPlayer.position + glm::vec3(0.0f, 0.0f, 1.6f), 1.0f),
+      glm::vec4(glm::normalize(glm::vec3(
+          std::cos(glm::radians(state.localPlayer.yaw)) *
+              std::cos(glm::radians(state.localPlayer.pitch)),
+          std::sin(glm::radians(state.localPlayer.yaw)) *
+              std::cos(glm::radians(state.localPlayer.pitch)),
+          std::sin(glm::radians(state.localPlayer.pitch)))), 0.0f),
+      voxel::kWorldEdge
   };
   vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
   vkCmdDispatch(cmd, (m_swapchain.extent.width + 7) / 8, (m_swapchain.extent.height + 7) / 8, 1);
@@ -643,7 +716,8 @@ void VulkanContext::recordCommands(FrameData &frame, uint32_t imageIndex, float 
   checkVk(vkEndCommandBuffer(cmd), "end command buffer");
 }
 
-void VulkanContext::drawFrame(float deltaTime, float totalTime, float health) {
+void VulkanContext::drawFrame(float deltaTime, float totalTime,
+                              const voxel::RenderState& state) {
   if (m_framebufferResized || m_window->isMinimized()) {
     recreateSwapchain();
     if (m_window->isMinimized() || m_swapchain.extent.width == 0 || m_swapchain.extent.height == 0)
@@ -675,10 +749,31 @@ void VulkanContext::drawFrame(float deltaTime, float totalTime, float health) {
     float instantFps = 1.0f / deltaTime;
     m_rollingFps = 0.95f * m_rollingFps + 0.05f * instantFps;
   }
-  m_ui.update({ health, m_rollingFps }, m_swapchain.extent.width, m_swapchain.extent.height);
+  const glm::vec3 viewDirection(
+      std::cos(glm::radians(state.localPlayer.yaw)) *
+          std::cos(glm::radians(state.localPlayer.pitch)),
+      std::sin(glm::radians(state.localPlayer.yaw)) *
+          std::cos(glm::radians(state.localPlayer.pitch)),
+      std::sin(glm::radians(state.localPlayer.pitch)));
+  const float health = state.localPlayer.grounded ? 0.85f : 0.80f;
+  m_ui.update(
+      {health,
+       m_rollingFps,
+       std::format("Position: {:.2f}, {:.2f}, {:.2f}",
+                   state.localPlayer.position.x,
+                   state.localPlayer.position.y,
+                   state.localPlayer.position.z),
+       std::format("Velocity: {:.2f}, {:.2f}, {:.2f}",
+                   state.localPlayer.velocity.x,
+                   state.localPlayer.velocity.y,
+                   state.localPlayer.velocity.z),
+       std::format("View: {:.2f}, {:.2f}, {:.2f}",
+                   viewDirection.x, viewDirection.y, viewDirection.z)},
+      m_swapchain.extent.width, m_swapchain.extent.height);
   updateOverlayBuffer(frame, m_ui.getVertices());
 
-  recordCommands(frame, imageIndex, deltaTime, totalTime);
+  uploadWorld(state);
+  recordCommands(frame, imageIndex, deltaTime, totalTime, state);
 
   // Modern Vulkan 1.3 synchronization2 submission
   VkSemaphoreSubmitInfo waitInfo{};

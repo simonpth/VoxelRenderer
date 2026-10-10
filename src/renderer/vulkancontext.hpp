@@ -26,9 +26,11 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <span>
 
 #include "window.hpp"
 #include "ui.hpp"
+#include "../simulation/state.hpp"
 
 #ifndef VOXEL_SHADER_DIR
 #define VOXEL_SHADER_DIR "shaders/"
@@ -43,7 +45,7 @@ public:
     VulkanContext& operator=(const VulkanContext&) = delete;
 
     // Call once per frame. Renders everything and presents.
-    void drawFrame(float deltaTime = 0.0f, float totalTime = 0.0f, float health = 0.85f);
+    void drawFrame(float deltaTime, float totalTime, const voxel::RenderState& state);
 
     // Call from resize event.
     void notifyResized() { m_framebufferResized = true; }
@@ -64,6 +66,9 @@ private:
         uint32_t height    = 0;
         float    time      = 0.0f;
         float    deltaTime = 0.0f;
+        glm::vec4 playerPosition{0.0f};
+        glm::vec4 viewDirection{0.0f, 0.0f, -1.0f, 0.0f};
+        uint32_t worldSize = voxel::kWorldEdge;
     };
 
     struct FrameData {
@@ -97,12 +102,16 @@ private:
     void createDescriptorPool();
     void createComputeImages();
     void destroyComputeImages();
+    void createWorldBuffer();
+    void destroyWorldBuffer();
+    void uploadWorld(const voxel::RenderState& state);
     void updateOverlayBuffer(FrameData& frame, const std::vector<OverlayVertex>& vertices);
 
     // --- runtime ---
     void cleanupSwapchain();
     void recreateSwapchain();
-    void recordCommands(FrameData& frame, uint32_t imageIndex, float deltaTime, float totalTime);
+    void recordCommands(FrameData& frame, uint32_t imageIndex, float deltaTime, float totalTime,
+                        const voxel::RenderState& state);
 
     // --- helpers ---
     VkShaderModule createShaderModule(const std::string& path);
@@ -142,6 +151,11 @@ private:
     VkDescriptorPool      m_descriptorPool      = VK_NULL_HANDLE;
 
     VkFormat m_computeImageFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    VkBuffer m_worldBuffer = VK_NULL_HANDLE;
+    VmaAllocation m_worldAllocation = VK_NULL_HANDLE;
+    void* m_worldMappedData = nullptr;
+    std::array<std::uint32_t, voxel::kVoxelCount * 2> m_uploadedWorld{};
+    bool m_worldUploaded = false;
 
     UI m_ui;
     float m_rollingFps = 60.0f;

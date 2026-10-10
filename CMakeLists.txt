@@ -189,7 +189,11 @@ add_executable(VoxelRenderer
 	src/main.cpp
 	src/renderer/vulkancontext.cpp
 	src/renderer/ui.cpp
-	src/engine/player.cpp
+	src/simulation/authority.cpp
+	src/network/protocol.cpp
+	src/network/udp_socket.cpp
+	src/network/server.cpp
+	src/network/client.cpp
 	"${VERTEX_SHADER}"
 	"${FRAGMENT_SHADER}"
 	"${COMPUTE_SHADER}"

@@ -246,7 +246,10 @@ void UI::update(const UIData& data, uint32_t screenWidth, uint32_t screenHeight)
       screenWidth == m_displayedWidth &&
       screenHeight == m_displayedHeight &&
       clampedHealth == m_displayedHealth &&
-      displayedFps == m_displayedFps) {
+      displayedFps == m_displayedFps &&
+      data.playerPosition == m_displayedPlayerPosition &&
+      data.playerVelocity == m_displayedPlayerVelocity &&
+      data.viewDirection == m_displayedViewDirection) {
     return;
   }
 
@@ -304,6 +307,33 @@ void UI::update(const UIData& data, uint32_t screenWidth, uint32_t screenHeight)
       m_fpsLength = std::clamp(m_fpsLength, 0, static_cast<int>(m_fpsBuffer.size() - 1));
       m_displayedFps = displayedFps;
     }
+    if (data.playerPosition != m_displayedPlayerPosition) {
+      m_playerPositionLength = std::snprintf(m_playerPositionBuffer.data(),
+                                             m_playerPositionBuffer.size(), "%s",
+                                             data.playerPosition.c_str());
+      m_playerPositionLength = std::clamp(
+          m_playerPositionLength, 0,
+          static_cast<int>(m_playerPositionBuffer.size() - 1));
+      m_displayedPlayerPosition = data.playerPosition;
+    }
+    if (data.viewDirection != m_displayedViewDirection) {
+      m_viewDirectionLength = std::snprintf(m_viewDirectionBuffer.data(),
+                                            m_viewDirectionBuffer.size(), "%s",
+                                            data.viewDirection.c_str());
+      m_viewDirectionLength = std::clamp(
+          m_viewDirectionLength, 0,
+          static_cast<int>(m_viewDirectionBuffer.size() - 1));
+      m_displayedViewDirection = data.viewDirection;
+    }
+    if (data.playerVelocity != m_displayedPlayerVelocity) {
+      m_playerVelocityLength = std::snprintf(m_playerVelocityBuffer.data(),
+                                             m_playerVelocityBuffer.size(), "%s",
+                                             data.playerVelocity.c_str());
+      m_playerVelocityLength = std::clamp(
+          m_playerVelocityLength, 0,
+          static_cast<int>(m_playerVelocityBuffer.size() - 1));
+      m_displayedPlayerVelocity = data.playerVelocity;
+    }
     Clay_String fpsString = Clay_String{
         .isStaticallyAllocated = false,
         .length = static_cast<int32_t>(m_fpsLength),
@@ -317,6 +347,36 @@ void UI::update(const UIData& data, uint32_t screenWidth, uint32_t screenHeight)
       CLAY_TEXT(fpsString, CLAY_TEXT_CONFIG({.textColor = {245, 245, 245, 255},
                                              .fontSize = 16,
                                              .letterSpacing = 0}));
+    }
+
+    const Clay_String playerPositionString{
+        .isStaticallyAllocated = false,
+        .length = static_cast<int32_t>(m_playerPositionLength),
+        .chars = m_playerPositionBuffer.data()};
+    const Clay_String viewDirectionString{
+        .isStaticallyAllocated = false,
+        .length = static_cast<int32_t>(m_viewDirectionLength),
+        .chars = m_viewDirectionBuffer.data()};
+    const Clay_String playerVelocityString{
+        .isStaticallyAllocated = false,
+        .length = static_cast<int32_t>(m_playerVelocityLength),
+        .chars = m_playerVelocityBuffer.data()};
+    CLAY({.id = CLAY_ID("DebugContainer"),
+          .layout = {
+              .padding = {.left = 10, .right = 10, .top = 4, .bottom = 4},
+              .childGap = 2,
+              .layoutDirection = CLAY_TOP_TO_BOTTOM},
+          .backgroundColor = {25, 25, 25, 200},
+          .cornerRadius = {4, 4, 4, 4}}) {
+      CLAY_TEXT(playerPositionString, CLAY_TEXT_CONFIG({.textColor = {245, 245, 245, 255},
+                                                        .fontSize = 14,
+                                                        .letterSpacing = 0}));
+      CLAY_TEXT(playerVelocityString, CLAY_TEXT_CONFIG({.textColor = {245, 245, 245, 255},
+                                                        .fontSize = 14,
+                                                        .letterSpacing = 0}));
+      CLAY_TEXT(viewDirectionString, CLAY_TEXT_CONFIG({.textColor = {245, 245, 245, 255},
+                                                       .fontSize = 14,
+                                                       .letterSpacing = 0}));
     }
   }
 
