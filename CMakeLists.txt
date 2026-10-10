@@ -101,6 +101,9 @@ set(SLANG_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/triangle.slang")
 set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
 set(VERTEX_SHADER "${SHADER_OUTPUT_DIR}/triangle.vert.spv")
 set(FRAGMENT_SHADER "${SHADER_OUTPUT_DIR}/triangle.frag.spv")
+set(COMPUTE_SHADER "${SHADER_OUTPUT_DIR}/pixel.comp.spv")
+set(OVERLAY_VERTEX_SHADER "${SHADER_OUTPUT_DIR}/overlay.vert.spv")
+set(OVERLAY_FRAGMENT_SHADER "${SHADER_OUTPUT_DIR}/overlay.frag.spv")
 
 if(VOXEL_ENABLE_SLANG)
 	add_custom_command(
@@ -119,6 +122,30 @@ if(VOXEL_ENABLE_SLANG)
 		DEPENDS "${SLANG_SOURCE}"
 		VERBATIM
 	)
+	add_custom_command(
+		OUTPUT "${COMPUTE_SHADER}"
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUTPUT_DIR}"
+		COMMAND "${SLANGC_EXECUTABLE}" -target spirv -profile spirv_1_3
+			-entry computeMain -stage compute -o "${COMPUTE_SHADER}" "${SLANG_SOURCE}"
+		DEPENDS "${SLANG_SOURCE}"
+		VERBATIM
+	)
+	add_custom_command(
+		OUTPUT "${OVERLAY_VERTEX_SHADER}"
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUTPUT_DIR}"
+		COMMAND "${SLANGC_EXECUTABLE}" -target spirv -profile spirv_1_3
+			-entry overlayVertexMain -stage vertex -o "${OVERLAY_VERTEX_SHADER}" "${SLANG_SOURCE}"
+		DEPENDS "${SLANG_SOURCE}"
+		VERBATIM
+	)
+	add_custom_command(
+		OUTPUT "${OVERLAY_FRAGMENT_SHADER}"
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUTPUT_DIR}"
+		COMMAND "${SLANGC_EXECUTABLE}" -target spirv -profile spirv_1_3
+			-entry overlayFragmentMain -stage fragment -o "${OVERLAY_FRAGMENT_SHADER}" "${SLANG_SOURCE}"
+		DEPENDS "${SLANG_SOURCE}"
+		VERBATIM
+	)
 else()
 	message(FATAL_ERROR "VOXEL_ENABLE_SLANG=OFF requires precompiled shader files, which are not configured")
 endif()
@@ -126,8 +153,12 @@ endif()
 add_executable(VoxelRenderer
 	src/main.cpp
 	src/renderer/vulkancontext.cpp
+  src/engine/player.cpp
 	"${VERTEX_SHADER}"
 	"${FRAGMENT_SHADER}"
+	"${COMPUTE_SHADER}"
+	"${OVERLAY_VERTEX_SHADER}"
+	"${OVERLAY_FRAGMENT_SHADER}"
 )
 
 target_include_directories(VoxelRenderer PRIVATE

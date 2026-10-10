@@ -52,17 +52,22 @@ private:
 
     static constexpr const char* vertexShaderPath   = VOXEL_SHADER_DIR "triangle.vert.spv";
     static constexpr const char* fragmentShaderPath = VOXEL_SHADER_DIR "triangle.frag.spv";
+    static constexpr const char* computeShaderPath = VOXEL_SHADER_DIR "pixel.comp.spv";
+    static constexpr const char* overlayVertexShaderPath = VOXEL_SHADER_DIR "overlay.vert.spv";
+    static constexpr const char* overlayFragmentShaderPath = VOXEL_SHADER_DIR "overlay.frag.spv";
 
-    struct Vertex {
-        float pos[2];
-        float color[3];
-    };
+    struct Vertex { float pos[2]; float color[3]; };
 
     struct FrameData {
         VkCommandPool   pool           = VK_NULL_HANDLE;
         VkCommandBuffer cmd            = VK_NULL_HANDLE;
         VkSemaphore     imageAvailable = VK_NULL_HANDLE;
         VkFence         inFlight       = VK_NULL_HANDLE;
+        VkImage computeImage = VK_NULL_HANDLE;
+        VmaAllocation computeAllocation = VK_NULL_HANDLE;
+        VkImageView computeImageView = VK_NULL_HANDLE;
+        VkDescriptorSet computeDescriptorSet = VK_NULL_HANDLE;
+        bool computeImageInitialized = false;
     };
 
     // --- init ---
@@ -72,12 +77,14 @@ private:
     void createSwapchain();
     void createFrameResources();
     void createPipeline();
-    void createVertexBuffer();
+    void createComputeResources();
+    void destroyComputeResources();
+    void createTriangleBuffer();
 
     // --- runtime ---
     void cleanupSwapchain();
     void recreateSwapchain();
-    void recordCommands(VkCommandBuffer cmd, uint32_t imageIndex);
+    void recordCommands(FrameData& frame, uint32_t imageIndex);
 
     // --- helpers ---
     VkShaderModule createShaderModule(const std::string& path);
@@ -112,10 +119,15 @@ private:
     // Pipeline
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
     VkPipeline       m_pipeline       = VK_NULL_HANDLE;
-
-    // Geometry (VMA)
-    VkBuffer      m_vertexBuffer     = VK_NULL_HANDLE;
-    VmaAllocation m_vertexAllocation = VK_NULL_HANDLE;
+    VkPipeline m_trianglePipeline = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_computePipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_computePipeline = VK_NULL_HANDLE;
+    VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
+    // A compute target per in-flight frame prevents read/write hazards across submissions.
+    VkFormat m_computeImageFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    VkBuffer m_triangleBuffer = VK_NULL_HANDLE;
+    VmaAllocation m_triangleAllocation = VK_NULL_HANDLE;
 
     bool m_framebufferResized = false;
 };
