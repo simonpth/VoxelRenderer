@@ -7,10 +7,11 @@
 
 namespace voxel::net {
 
+// Length-prefixed TCP frames. Blocking by default so it can be driven from a
+// dedicated world-stream thread; `pollReadable` lets that thread interleave
+// sending and receiving without extra threads.
 class TcpSocket {
-public:
-    // Frames are length-prefixed little-endian and capped at 64 MiB. The
-    // blocking receive API is intended for a dedicated world-stream thread.
+  public:
     TcpSocket() = default;
     explicit TcpSocket(int handle) : m_handle(handle) {}
     ~TcpSocket();
@@ -25,10 +26,14 @@ public:
     void nonBlocking();
     void shutdown();
     bool valid() const { return m_handle >= 0; }
+
+    // Milliseconds to wait before deciding the socket is idle.
+    bool pollReadable(int timeoutMs) const;
+
     bool sendFrame(std::span<const std::byte> payload) const;
     bool receiveFrame(std::vector<std::byte>& payload) const;
 
-private:
+  private:
     void close();
     int m_handle = -1;
 };

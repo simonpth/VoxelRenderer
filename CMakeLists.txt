@@ -187,6 +187,7 @@ endif()
 
 add_executable(VoxelRenderer
 	src/main.cpp
+	src/config.cpp
 	src/renderer/vulkancontext.cpp
 	src/renderer/ui.cpp
 	src/simulation/authority.cpp
@@ -251,11 +252,37 @@ if(VOXEL_BUILD_TESTS)
 	add_executable(VoxelSvoTests
 		tests/svo_test.cpp
 		src/simulation/svo.cpp
-		src/network/protocol.cpp
 	)
 	target_include_directories(VoxelSvoTests PRIVATE
 		"${CMAKE_CURRENT_SOURCE_DIR}/src"
 	)
 	target_link_libraries(VoxelSvoTests PRIVATE glm::glm)
 	add_test(NAME VoxelSvoTests COMMAND VoxelSvoTests)
+
+	add_executable(VoxelProtocolTests
+		tests/protocol_test.cpp
+		src/network/protocol.cpp
+		src/simulation/svo.cpp
+	)
+	target_include_directories(VoxelProtocolTests PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/src"
+	)
+	target_link_libraries(VoxelProtocolTests PRIVATE glm::glm)
+	add_test(NAME VoxelProtocolTests COMMAND VoxelProtocolTests)
+
+	add_executable(VoxelLifecycleTests
+		tests/lifecycle_test.cpp
+		src/network/client.cpp
+		src/network/server.cpp
+		src/network/protocol.cpp
+		src/network/tcp_socket.cpp
+		src/network/udp_socket.cpp
+		src/simulation/authority.cpp
+		src/simulation/svo.cpp
+	)
+	target_include_directories(VoxelLifecycleTests PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/src"
+	)
+	target_link_libraries(VoxelLifecycleTests PRIVATE glm::glm)
+	add_test(NAME VoxelLifecycleTests COMMAND VoxelLifecycleTests)
 endif()

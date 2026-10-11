@@ -1,45 +1,258 @@
+// Round-trip tests for the sparse voxel octree and the world's root layer.
+//
+// Every test works against the same invariants the server and the renderer
+// rely on: a compacted snapshot must answer exactly like a direct lookup, and
+// the root layer must be addressable in O(1) without any hashing.
+
 #include <cassert>
-#include "../src/simulation/svo.hpp"
-#include "../src/network/protocol.hpp"
+#include <cstdio>
+#include <cstdint>
+#include <vector>
+
+#include "simulation/svo.hpp"
+
+using namespace voxel;
+
+namespace {
+
+void brickCompact(const Brick& brick, std::vector<SvoNode>& nodes,
+                  SvoNode& root) {
+    brick.compact(nodes, root);
+}
+
+// Walks a compacted brick with the same addressing rules the GPU shader uses,
+// so a CPU-side mismatch fails here instead of on screen.
+std::uint16_t packedLookup(const std::vector<SvoNode>& nodes, std::uint32_t x,
+                          std::uint32_t y, std::uint32_t z, std::uint32_t brick) {
+    if (nodes.empty()) return 0;
+    if (x >= brick || y >= brick || z >= brick) return 0;
+    std::uint32_t index = 0;
+    std::uint32_t size = brick;
+    std::int32_t xi = static_cast<std::int32_t>(x);
+    std::int32_t yi = static_cast<std::int32_t>(y);
+    std::int32_t zi = static_cast<std::int32_t>(z);
+    for (;;) {
+        const SvoNode& node = nodes[index];
+        const std::uint8_t mask = node.mask;
+        if (mask == 0) return node.solid() ? node.material : 0;
+        const std::uint32_t half = size >> 1;
+        const std::uint32_t kid =
+            (xi >= static_cast<std::int32_t>(half) ? 1u : 0u) |
+            (yi >= static_cast<std::int32_t>(half) ? 2u : 0u) |
+            (zi >= static_cast<std::int32_t>(half) ? 4u : 0u);
+        if ((mask & (1u << kid)) == 0) return 0;
+        index = node.firstChild() +
+                static_cast<std::uint32_t>(
+                    __builtin_popcount(mask & ((1u << kid) - 1u)));
+        size = half;
+        if (kid & 1u) xi -= static_cast<std::int32_t>(half);
+        if (kid & 2u) yi -= static_cast<std::int32_t>(half);
+        if (kid & 4u) zi -= static_cast<std::int32_t>(half);
+    }
+}
+
+} // namespace
 
 int main() {
-    voxel::SvoRegion region;
-    assert(region.get(3, 4, 5).material == 0);
-    region.set(3, 4, 5, 7);
-    assert(region.get(3, 4, 5).material == 7);
-    assert(region.get(3, 4, 6).material == 0);
-    region.set(3, 4, 5, 0);
-    assert(region.get(3, 4, 5).material == 0);
+    // --- brick basics ---
+    {
+        Brick brick(7);   // 128^3 brick, lodLevel 7
+        assert(brick.get(0, 0, 0) == 0);
+        assert(brick.empty());
+        brick.set(3, 4, 5, 7);
+        assert(brick.get(3, 4, 5) == 7);
+        assert(brick.get(3, 4, 6) == 0);
+        brick.set(3, 4, 5, 0);
+        assert(brick.get(3, 4, 5) == 0);
+        // Collapsed back to nothing reusable: the whole brick is empty again.
+        assert(brick.empty());
+    }
 
-    region.fill(0, 0, 0, 128, 128, 1, 3);
-    assert(region.get(0, 0, 0).material == 3);
-    assert(region.get(127, 127, 0).material == 3);
-    assert(region.get(0, 0, 1).material == 0);
+    // --- fill and merge ---
+    {
+        Brick brick(7);
+        brick.fill(0, 0, 0, 16, 16, 16, 3);
+        assert(brick.get(0, 0, 0) == 3);
+        assert(brick.get(15, 15, 15) == 3);
+        assert(brick.get(0, 0, 16) == 0);
+        assert(brick.get(16, 0, 0) == 0);
+        // The box is fully aligned to a 16-cell node, so it must fuse into a
+        // single solid leaf rather than a 16x16x16 forest of children: a
+        // compacted snapshot of that brick is exactly one node.
+        SvoNode fused{};
+        std::vector<SvoNode> fusedNodes;
+        brickCompact(brick, fusedNodes, fused);
+        assert(fusedNodes.size() == 1);
+        assert(fused.solid());
+        assert(fused.material == 3);
+        // A partial update must not disturb the rest.
+        brick.set(15, 15, 15, 9);
+        assert(brick.get(15, 15, 15) == 9);
+        assert(brick.get(0, 0, 0) == 3);
+        brick.set(15, 15, 15, 3);
+    }
 
-    voxel::SvoWorld world(1234);
-    world.set(-1, -1, 100, 9);
-    assert(world.get(static_cast<std::int64_t>(voxel::kWorldWidth) - 1,
-                     static_cast<std::int64_t>(voxel::kWorldWidth) - 1, 100).material == 9);
-    assert(world.isSolid(0, 0, -1));
-    assert(!world.isSolid(0, 0, static_cast<std::int32_t>(voxel::kWorldDepth)));
+    // --- out-of-range cells are air ---
+    {
+        Brick brick(7);
+        brick.set(0, 0, 0, 1);
+        assert(brick.get(128, 0, 0) == 0);
+        assert(brick.get(0, 128, 0) == 0);
+        assert(brick.get(0, 0, 128) == 0);
+        brick.set(1000, 0, 0, 1);   // rejected, no crash, no write
+        assert(brick.get(1000, 0, 0) == 0);
+    }
 
-    voxel::net::RegionSnapshot snapshot{
-        {1, 2, 3}, region.revision(), world.revision(), region.nodes()};
-    const auto encoded = voxel::net::encode(snapshot);
-    voxel::net::RegionSnapshot decoded{};
-    assert(!encoded.empty());
-    assert(voxel::net::decode(encoded, decoded));
-    assert(decoded.coordinate == snapshot.coordinate);
-    assert(decoded.nodes.size() == snapshot.nodes.size());
-    assert(decoded.revision == snapshot.revision);
-    assert(decoded.worldRevision == snapshot.worldRevision);
+    // --- world: root layer indexing and bounded lookups ---
+    {
+        const WorldSpec spec{64, 96, 32, 16};   // deliberately non-cubic
+        World world(spec, 1234);
+        assert(world.rootCount() == 4 * 6 * 2);
+        assert(world.rootDimX() == 4);
+        assert(world.rootDimY() == 6);
+        assert(world.rootDimZ() == 2);
+        // Every brick is reachable, and outside the world is air.
+        for (std::int32_t z = -2; z < 34; ++z)
+            for (std::int32_t y = -2; y < 98; ++y)
+                for (std::int32_t x = -2; x < 66; ++x)
+                    assert(world.get(x, y, z) ==
+                           (x >= 0 && y >= 0 && z >= 0 && x < 64 && y < 96 &&
+                                    z < 32
+                                ? terrainMaterial(x, y, z,
+                                                  terrainTop(x, y, 32))
+                                : 0));
+        // Below the world floor is solid, above the ceiling is empty.
+        assert(world.isSolid(0, 0, -1));
+        assert(!world.isSolid(0, 0, 32));
+    }
 
-    voxel::net::RegionInterestRequest interest{{}, {255, 255, 10},
-                                               {254, 0, 10}, 5};
-    const auto interestBytes = voxel::net::encode(interest);
-    voxel::net::RegionInterestRequest decodedInterest{};
-    assert(voxel::net::decode(interestBytes, decodedInterest));
-    assert(decodedInterest.center == interest.center);
-    assert(decodedInterest.radius == interest.radius);
+    // --- snapshot round trip: GPU-shaped data answers like the tree ---
+    {
+        const WorldSpec spec{1024, 1024, 256, 128};
+        World world(spec, 0xC0FFEE);
+        world.generateAll();
+
+        std::size_t totalNodes = 0;
+        std::size_t residentBricks = 0;
+        for (std::uint32_t brick = 0; brick < world.rootCount(); ++brick) {
+            SvoNode root{};
+            std::vector<SvoNode> nodes;
+            std::uint32_t revision = 0;
+            world.snapshot(brick, revision, root, nodes);
+            if (!nodes.empty()) ++residentBricks;
+            totalNodes += nodes.size();
+
+            // Node 0 is the brick root; children must be in range.
+            for (std::size_t i = 0; i < nodes.size(); ++i) {
+                const SvoNode& node = nodes[i];
+                if (!node.hasChildren()) {
+                    assert(node.firstChild() == 0);
+                    continue;
+                }
+                assert(node.lodLevel ==
+                       brickLodLevel(spec.brick) - (i == 0 ? 0 : 1));
+                assert(node.firstChild() >= 1);
+                assert(node.firstChild() < nodes.size());
+            }
+
+            // Sparse cell sweep: the packed array must agree with the tree.
+            const std::uint32_t dimX = spec.rootDimX();
+            const std::uint32_t dimY = spec.rootDimY();
+            const std::uint32_t originX = (brick % dimX) * spec.brick;
+            const std::uint32_t originY = ((brick / dimX) % dimY) * spec.brick;
+            const std::uint32_t originZ =
+                (brick / (dimX * dimY)) * spec.brick;
+            for (std::uint32_t lz = 0; lz < spec.brick; lz += 7)
+                for (std::uint32_t ly = 0; ly < spec.brick; ly += 11)
+                    for (std::uint32_t lx = 0; lx < spec.brick; lx += 13) {
+                        const std::uint16_t packed =
+                            packedLookup(nodes, lx, ly, lz, spec.brick);
+                        const std::uint16_t direct =
+                            world.get(static_cast<std::int32_t>(originX + lx),
+                                      static_cast<std::int32_t>(originY + ly),
+                                      static_cast<std::int32_t>(originZ + lz));
+                        if (packed != direct) {
+                            std::printf(
+                                "snapshot mismatch: brick %u cell (%u,%u,%u) "
+                                "packed=%u direct=%u\n",
+                                brick, lx, ly, lz, packed, direct);
+                            return 1;
+                        }
+                    }
+        }
+        assert(residentBricks == world.rootCount());
+        // The full 1024x1024x256 world must stay compact enough to live in the
+        // GPU arena; this is the number that the pool is sized against.
+        std::printf("world nodes=%zu bytes=%zu (%.1f KB/brick)\n", totalNodes,
+                    totalNodes * sizeof(SvoNode),
+                    static_cast<double>(totalNodes * sizeof(SvoNode)) /
+                        static_cast<double>(residentBricks) / 1024.0);
+        assert(totalNodes < 24u * 1024u * 1024u);
+    }
+
+    // --- edits bump the revision of the brick that changed ---
+    {
+        World world({128, 128, 128, 128}, 7);
+        world.set(4, 4, 4, 6);
+        assert(world.get(4, 4, 4) == 6);
+        assert(world.revision() > 1);
+        SvoNode root{};
+        std::vector<SvoNode> nodes;
+        std::uint32_t revision = 0;
+        world.snapshot(0, revision, root, nodes);
+        assert(revision == world.revision());
+        assert(world.get(4, 4, 4) == 6);
+        // Out-of-world writes are dropped, not clamped.
+        world.set(-1, 0, 0, 1);
+        world.set(128, 0, 0, 1);
+        world.set(0, 0, 128, 1);
+        assert(world.get(0, 0, 0) == 0);
+    }
+
+    // --- bricks entirely above the terrain surface ---
+    {
+        // The upper brick of every column sits above the surface. Its height
+        // mipmap must read as empty, or a wrap-around turns it into rock.
+        const WorldSpec spec{256, 256, 256, 128};
+        World world(spec, 99);
+        world.generateAll();
+        // Brick (1,*,1) spans z in [128,256), entirely above the surface.
+        std::size_t upperSolid = 0;
+        std::size_t lowerSolid = 0;
+        for (std::uint32_t rootIndex = 0; rootIndex < world.rootCount(); ++rootIndex) {
+            const std::uint32_t dimX = spec.rootDimX();
+            const std::uint32_t bx = rootIndex % dimX;
+            const std::uint32_t bz = rootIndex / (dimX * spec.rootDimY());
+            const bool upper = bz == 1;
+            for (std::int32_t z = 0; z < 128; ++z)
+                for (std::int32_t y = 0; y < 128; y += 7)
+                    for (std::int32_t x = 0; x < 128; x += 7) {
+                        const std::int32_t wx = static_cast<std::int32_t>(bx * 128 + x);
+                        const std::int32_t wy = static_cast<std::int32_t>((rootIndex / dimX) % spec.rootDimY()) * 128 + y;
+                        const bool solid = world.isSolid(wx, wy, 128 * bz + z);
+                        if (solid) { if (upper) ++upperSolid; else ++lowerSolid; }
+                    }
+        }
+        if (upperSolid != 0) {
+            std::printf("upper brick has %zu solid cells, expected 0\n",
+                        upperSolid);
+            return 1;
+        }
+        std::printf("upper bricks empty, lower bricks have %zu solid cells\n",
+                    lowerSolid);
+    }
+
+    // --- material table ---
+    {
+        const auto& materials = serverMaterials();
+        assert(materials.size() == kMaterialCount);
+        assert(materials[0].flags == 0);   // air is neither solid nor emissive
+        for (std::size_t i = 1; i < materials.size(); ++i) {
+            assert(materials[i].flags & kMaterialSolid);
+            assert(materials[i].a > 0.5f);
+        }
+    }
+
+    std::printf("svo tests passed\n");
     return 0;
 }

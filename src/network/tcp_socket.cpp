@@ -6,13 +6,14 @@
 #include <cstring>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <stdexcept>
 #include <sys/socket.h>
 #include <unistd.h>
 
 namespace voxel::net {
 namespace {
-constexpr std::uint32_t kMaxFrameBytes = 64u * 1024u * 1024u;
+constexpr std::uint32_t kMaxFrameBytes = 256u * 1024u * 1024u;
 
 void writeU32(std::byte* output, std::uint32_t value) {
     output[0] = std::byte(value);
@@ -40,7 +41,13 @@ bool transfer(int handle, std::byte* data, std::size_t size, bool send) {
     }
     return true;
 }
+
+void applyTimeouts(int handle) {
+    const timeval timeout{10, 0};
+    ::setsockopt(handle, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    ::setsockopt(handle, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 }
+} // namespace
 
 TcpSocket::~TcpSocket() { close(); }
 
@@ -78,7 +85,8 @@ void TcpSocket::listen(std::uint16_t port, int backlog) {
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_ANY);
     address.sin_port = htons(port);
-    if (::bind(m_handle, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 ||
+    if (::bind(m_handle, reinterpret_cast<const sockaddr*>(&address),
+               sizeof(address)) != 0 ||
         ::listen(m_handle, backlog) != 0) {
         close();
         throw std::runtime_error(std::string("listen TCP socket failed: ") +
@@ -88,12 +96,16 @@ void TcpSocket::listen(std::uint16_t port, int backlog) {
 
 TcpSocket TcpSocket::accept() {
     const int accepted = ::accept(m_handle, nullptr, nullptr);
-    if (accepted < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+    if (accepted < 0 &&
+        (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
         return TcpSocket{};
     if (accepted >= 0) {
-        const timeval timeout{5, 0};
-        ::setsockopt(accepted, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        ::setsockopt(accepted, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        // The listener is non-blocking and the accepted socket inherits that
+        // flag on POSIX. An O_NONBLOCK socket ignores SO_SNDTIMEO, so a large
+        // frame would fail with EAGAIN instead of waiting. Clear it here.
+        const int flags = fcntl(accepted, F_GETFL, 0);
+        if (flags >= 0) fcntl(accepted, F_SETFL, flags & ~O_NONBLOCK);
+        applyTimeouts(accepted);
     }
     return TcpSocket(accepted);
 }
@@ -106,14 +118,13 @@ void TcpSocket::connect(const char* host, std::uint16_t port) {
     address.sin_family = AF_INET;
     address.sin_port = htons(port);
     if (inet_pton(AF_INET, host, &address.sin_addr) != 1 ||
-        ::connect(m_handle, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0) {
+        ::connect(m_handle, reinterpret_cast<const sockaddr*>(&address),
+                  sizeof(address)) != 0) {
         close();
         throw std::runtime_error(std::string("connect TCP socket failed: ") +
                                  std::strerror(errno));
     }
-    const timeval timeout{5, 0};
-    ::setsockopt(m_handle, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    ::setsockopt(m_handle, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    applyTimeouts(m_handle);
 }
 
 void TcpSocket::nonBlocking() {
@@ -122,17 +133,29 @@ void TcpSocket::nonBlocking() {
         throw std::runtime_error("set TCP socket non-blocking failed");
 }
 
+bool TcpSocket::pollReadable(int timeoutMs) const {
+    if (!valid()) return false;
+    pollfd descriptor{};
+    descriptor.fd = m_handle;
+    descriptor.events = POLLIN;
+    const int result = ::poll(&descriptor, 1, timeoutMs);
+    return result > 0 && (descriptor.revents & POLLIN) != 0;
+}
+
 bool TcpSocket::sendFrame(std::span<const std::byte> payload) const {
-    if (!valid() || payload.empty() || payload.size() > kMaxFrameBytes) return false;
+    if (!valid() || payload.empty() || payload.size() > kMaxFrameBytes)
+        return false;
     std::array<std::byte, 4> header{};
     writeU32(header.data(), static_cast<std::uint32_t>(payload.size()));
     return transfer(m_handle, header.data(), header.size(), true) &&
-           transfer(m_handle, const_cast<std::byte*>(payload.data()), payload.size(), true);
+           transfer(m_handle, const_cast<std::byte*>(payload.data()),
+                    payload.size(), true);
 }
 
 bool TcpSocket::receiveFrame(std::vector<std::byte>& payload) const {
     std::array<std::byte, 4> header{};
-    if (!valid() || !transfer(m_handle, header.data(), header.size(), false)) return false;
+    if (!valid() || !transfer(m_handle, header.data(), header.size(), false))
+        return false;
     const auto size = readU32(header.data());
     if (size == 0 || size > kMaxFrameBytes) return false;
     payload.resize(size);

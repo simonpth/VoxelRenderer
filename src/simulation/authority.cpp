@@ -4,106 +4,126 @@
 #include <cmath>
 
 namespace voxel {
+
 namespace {
-constexpr float kGravity = 20.0f;
-constexpr float kJumpSpeed = 7.0f;
-constexpr float kPlayerRadius = 0.35f;
-constexpr float kPlayerHeight = 2.0f;
+constexpr float kGravity = 24.0f;
+constexpr float kJumpSpeed = 8.6f;
+constexpr float kMoveSpeed = 5.6f;
+constexpr float kPlayerRadius = 0.3f;
+constexpr float kPlayerHeight = 1.8f;
+constexpr float kEyeHeight = 1.6f;
+constexpr float kMaxStep = 0.25f;   // sub-step size for swept collision
+} // namespace
 
-float wrapDegrees(float value) {
-    while (value > 180.0f) value -= 360.0f;
-    while (value < -180.0f) value += 360.0f;
-    return value;
+glm::vec3 Authority::spawnPosition(const World& world) {
+    const auto centreX = static_cast<float>(world.spec().sizeX) * 0.5f;
+    const auto centreY = static_cast<float>(world.spec().sizeY) * 0.5f;
+    const auto cx = static_cast<std::int32_t>(std::floor(centreX));
+    const auto cy = static_cast<std::int32_t>(std::floor(centreY));
+    const auto top = terrainTop(cx, cy, static_cast<std::int32_t>(world.spec().sizeZ));
+    return glm::vec3(centreX, centreY, static_cast<float>(top) + 6.0f);
 }
 
-}
-
-Authority::Authority(std::uint32_t playerId, std::shared_ptr<SvoWorld> world)
-    : m_svoWorld(std::move(world)) {
-    if (!m_svoWorld) m_svoWorld = std::make_shared<SvoWorld>();
+Authority::Authority(std::uint32_t playerId, World& world)
+    : m_world(world) {
     m_state.localPlayer.id = playerId;
-    m_state.world = makeTerrain();
-    // The dense world remains a temporary snapshot compatibility field. New
-    // collision queries use the region-partitioned SVO below.
-    // The generated height map is centered around z=64 with a maximum below
-    // 96, so the initial feet position starts safely above terrain.
-    m_state.localPlayer.position = {16.0f, 16.0f, 96.0f};
+    m_state.localPlayer.position = spawnPosition(world);
     m_state.localPlayer.grounded = false;
     m_state.playerCount = 1;
     m_state.players[0] = m_state.localPlayer;
 }
 
-void Authority::step(const InputIntent& intent, float seconds) {
-    m_intent = intent;
-    auto& player = m_state.localPlayer;
-
-    player.yaw = wrapDegrees(player.yaw + intent.look.x);
-    player.pitch = std::clamp(player.pitch + intent.look.y, -89.0f, 89.0f);
-
-    player.velocity.x = intent.horizontalDelta.x / seconds;
-    player.velocity.y = intent.horizontalDelta.y / seconds;
-
-    const bool wasGrounded = player.grounded;
-    if (intent.jumpPressed && wasGrounded) {
-        player.velocity.z = kJumpSpeed;
-        player.grounded = false;
-    }
-    player.velocity.z -= kGravity * seconds;
-    movePlayer(seconds);
-
-    m_state.players[0] = player;
-    m_state.acknowledgedInputTick = std::max(
-        m_state.acknowledgedInputTick, intent.clientTick);
-    ++m_state.tick;
+bool Authority::collides(glm::vec3 position) const {
+    const int minX = static_cast<int>(std::floor(position.x - kPlayerRadius));
+    const int maxX = static_cast<int>(std::floor(position.x + kPlayerRadius));
+    const int minY = static_cast<int>(std::floor(position.y - kPlayerRadius));
+    const int maxY = static_cast<int>(std::floor(position.y + kPlayerRadius));
+    const int minZ = static_cast<int>(std::floor(position.z));
+    const int maxZ =
+        static_cast<int>(std::ceil(position.z + kPlayerHeight - 1e-4f)) - 1;
+    for (int z = minZ; z <= maxZ; ++z)
+        for (int y = minY; y <= maxY; ++y)
+            for (int x = minX; x <= maxX; ++x)
+                if (m_world.isSolid(x, y, z)) return true;
+    return false;
 }
 
 void Authority::movePlayer(float seconds) {
-    auto& player = m_state.localPlayer;
-    player.position += player.velocity * seconds;
-    player.position.x = std::clamp(
-        player.position.x, kPlayerRadius,
-        static_cast<float>(kWorldWidth) - kPlayerRadius);
-    player.position.y = std::clamp(
-        player.position.y, kPlayerRadius,
-        static_cast<float>(kWorldWidth) - kPlayerRadius);
-    const auto solid = [&](int x, int y, int z) {
-        return m_svoWorld->isSolid(x, y, z);
-    };
-    const auto collides = [&](glm::vec3 position) {
-        const int minX = static_cast<int>(std::floor(position.x - kPlayerRadius));
-        const int maxX = static_cast<int>(std::floor(position.x + kPlayerRadius));
-        const int minY = static_cast<int>(std::floor(position.y - kPlayerRadius));
-        const int maxY = static_cast<int>(std::floor(position.y + kPlayerRadius));
-        const int minZ = static_cast<int>(std::floor(position.z));
-        const int maxZ = static_cast<int>(
-            std::ceil(position.z + kPlayerHeight) - 1.0f);
-        for (int z = minZ; z <= maxZ; ++z)
-            for (int y = minY; y <= maxY; ++y)
-                for (int x = minX; x <= maxX; ++x)
-                    if (solid(x, y, z)) return true;
-        return false;
-    };
-    const glm::vec3 previous = player.position - player.velocity * seconds;
-    glm::vec3 resolved = previous;
-    resolved.x = player.position.x;
-    if (collides(resolved)) {
-        resolved.x = previous.x;
-        player.velocity.x = 0.0f;
-    }
-    resolved.y = player.position.y;
-    if (collides(resolved)) {
-        resolved.y = previous.y;
-        player.velocity.y = 0.0f;
-    }
-    resolved.z = player.position.z;
-    if (collides(resolved)) {
-        resolved.z = previous.z;
-        player.velocity.z = 0.0f;
-        player.grounded = player.position.z < previous.z;
-    } else {
-        player.grounded = false;
+    const auto& spec = m_world.spec();
+    PlayerState& player = m_state.localPlayer;
+    const glm::vec3 start = player.position;
+
+    const float yawRadians = player.yaw;
+    const glm::vec2 forward{std::cos(yawRadians), std::sin(yawRadians)};
+    const glm::vec2 right{-forward.y, forward.x};
+    const glm::vec2 wish =
+        (forward * m_wishMove.y + right * m_wishMove.x) * kMoveSpeed;
+    player.velocity.x = wish.x;
+    player.velocity.y = wish.y;
+
+    glm::vec3 target = start + player.velocity * seconds;
+    target.x = std::clamp(target.x, kPlayerRadius,
+                          static_cast<float>(spec.sizeX) - kPlayerRadius);
+    target.y = std::clamp(target.y, kPlayerRadius,
+                          static_cast<float>(spec.sizeY) - kPlayerRadius);
+
+    glm::vec3 resolved = start;
+    for (int axis = 0; axis < 3; ++axis) {
+        const float delta = target[static_cast<glm::vec3::length_type>(axis)] -
+                            resolved[static_cast<glm::vec3::length_type>(axis)];
+        if (delta == 0.0f) continue;
+        const int steps =
+            std::max(1, static_cast<int>(std::ceil(std::abs(delta) / kMaxStep)));
+        const float step = delta / static_cast<float>(steps);
+        for (int s = 0; s < steps; ++s) {
+            glm::vec3 trial = resolved;
+            trial[static_cast<glm::vec3::length_type>(axis)] += step;
+            if (collides(trial)) {
+                player.velocity[static_cast<glm::vec3::length_type>(axis)] = 0.0f;
+                break;
+            }
+            resolved = trial;
+        }
     }
     player.position = resolved;
+
+    // Grounded probe: the 2x2 footprint of cells directly below the feet.
+    const int fx = static_cast<int>(std::floor(player.position.x));
+    const int fy = static_cast<int>(std::floor(player.position.y));
+    const int fz = static_cast<int>(std::floor(player.position.z));
+    const int r = static_cast<int>(std::floor(kPlayerRadius));
+    bool grounded = false;
+    for (int y = fy - r; !grounded && y <= fy + r; ++y)
+        for (int x = fx - r; x <= fx + r; ++x)
+            if (m_world.isSolid(x, y, fz - 1)) { grounded = true; break; }
+    player.grounded = grounded;
+    (void)kEyeHeight;
+}
+
+void Authority::step(const InputIntent& intent) {
+    PlayerState& player = m_state.localPlayer;
+
+    // Look is accumulated on the server so every client sees the same
+    // orientation, but the client applies it locally too for responsiveness.
+    player.yaw += intent.look.x;
+    while (player.yaw > 180.0f) player.yaw -= 360.0f;
+    while (player.yaw < -180.0f) player.yaw += 360.0f;
+    player.pitch = std::clamp(player.pitch + intent.look.y, -89.0f, 89.0f);
+
+    m_wishMove = glm::clamp(intent.move, glm::vec2(-1.0f), glm::vec2(1.0f));
+
+    if (intent.jumpPressed && player.grounded) {        player.velocity.z = kJumpSpeed;
+        player.grounded = false;
+    }
+    player.velocity.z -= kGravity * kTickSeconds;
+    player.velocity.z = std::max(player.velocity.z, -60.0f);
+
+    movePlayer(kTickSeconds);
+
+    m_state.players[0] = player;
+    m_state.acknowledgedInputTick =
+        std::max(m_state.acknowledgedInputTick, intent.clientTick);
+    ++m_state.tick;
 }
 
 } // namespace voxel
