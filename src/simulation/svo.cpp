@@ -4,7 +4,12 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
+
+#include "lod.hpp"
+#include "octree.hpp"
+#include "region.hpp"
 
 namespace voxel {
 
@@ -47,6 +52,9 @@ float noiseAt(std::uint32_t x, std::uint32_t y, std::uint32_t cell,
 // Surface height of one world column: three octaves of value noise.
 constexpr std::uint32_t kTerrainSeed = 0x5EED1234u;
 constexpr float kTerrainBase = 46.0f;
+// Bumped when a change here would make the same seed produce a different
+// world. Saved regions record it and refuse to load on a mismatch.
+constexpr std::uint32_t kGeneratorVersion = 2;
 
 float terrainHeight(std::int32_t x, std::int32_t y) {
     const auto ux = static_cast<std::uint32_t>(x < 0 ? 0 : x);
@@ -63,8 +71,12 @@ constexpr std::uint16_t kGrassId = 3;
 constexpr std::uint16_t kSandId = 4;
 constexpr std::uint16_t kLavaId = 5;
 
-// Stratification, in cells measured from the column top.
-constexpr std::uint32_t kLavaBand = 2;   // z < kLavaBand is always lava
+// Stratification, in cells measured from the column top. These are *world*
+// z bands: terrainMaterial applies them to the world coordinate, so the
+// generator has to compare against a world z too. Applying them to a
+// brick-local z makes every brick above z=0 repeat the lava and dirt bands
+// at its own floor, which is how a 32-tall world ends up with lava at z=16.
+constexpr std::uint32_t kLavaBand = 2;   // world z < kLavaBand is always lava
 constexpr std::uint32_t kDirtBand = 5;   // [top-kDirtBand, top-2) is dirt
 
 } // namespace
@@ -73,6 +85,24 @@ std::uint32_t brickLodLevel(std::uint32_t brick) {
     std::uint32_t level = 0;
     while ((1u << (level + 1)) <= brick) ++level;
     return level;
+}
+
+std::uint32_t generatorVersion() {
+    // A saved region stores this. Bumping kGeneratorVersion above is the
+    // supported way to invalidate old saves; the constants are folded in too
+    // so an accidental edit is unlikely to go unnoticed.
+    std::uint32_t version = 0x5647454Eu;   // "VGEN"
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &kTerrainBase, sizeof bits);
+    const std::uint32_t parts[] = {
+        kTerrainSeed, bits, kLavaBand, kDirtBand, kGeneratorVersion,
+        kStoneId, kDirtId, kGrassId, kSandId, kLavaId,
+    };
+    for (const std::uint32_t part : parts) {
+        version ^= part;
+        version *= 0x01000193u;   // FNV-1a
+    }
+    return version;
 }
 
 std::uint32_t terrainTop(std::int32_t x, std::int32_t y, std::int32_t maxZ) {
@@ -112,109 +142,24 @@ const std::vector<Material>& serverMaterials() {
 
 // ---------------------------------------------------------------------------
 // Brick
+//
+// Storage and the node primitives live in Octree; only the cell-addressed API
+// is brick-specific.
 // ---------------------------------------------------------------------------
-
-Brick::Brick(std::uint32_t lodLevel) : m_nodes(1) {
-    m_nodes[0].lodLevel = static_cast<std::uint8_t>(lodLevel);
-}
-
-std::uint32_t Brick::allocateBlock(std::uint32_t parent) {
-    std::uint32_t firstChild = 0;
-    if (!m_freeBlocks.empty()) {
-        firstChild = m_freeBlocks.back();
-        m_freeBlocks.pop_back();
-        std::fill_n(m_nodes.begin() + static_cast<std::ptrdiff_t>(firstChild), 8,
-                    SvoNode{});
-    } else {
-        firstChild = static_cast<std::uint32_t>(m_nodes.size());
-        m_nodes.resize(m_nodes.size() + 8);
-    }
-    SvoNode& node = m_nodes[parent];
-    const std::uint8_t level = node.lodLevel;
-    node.setFirstChild(firstChild);
-    node.setFlags(0);   // internal nodes carry material flags on leaves only
-    node.mask = 0xFF;
-    for (std::uint32_t i = 0; i < 8; ++i)
-        m_nodes[firstChild + i].lodLevel = static_cast<std::uint8_t>(level - 1);
-    return firstChild;
-}
-
-void Brick::releaseSubtree(std::uint32_t firstChild) {
-    const SvoNode& node = m_nodes[firstChild];
-    if (!node.hasChildren()) return;
-    for (std::uint32_t i = 0; i < 8; ++i) releaseSubtree(firstChild + i);
-    m_freeBlocks.push_back(firstChild);
-}
-
-std::uint32_t Brick::split(std::uint32_t nodeIndex) {
-    if (m_nodes[nodeIndex].hasChildren()) return m_nodes[nodeIndex].firstChild();
-    return allocateBlock(nodeIndex);
-}
-
-void Brick::writeLeaf(std::uint32_t nodeIndex, std::uint16_t material) {
-    SvoNode& node = m_nodes[nodeIndex];
-    if (node.hasChildren()) {
-        const std::uint32_t firstChild = node.firstChild();
-        releaseSubtree(firstChild);
-        node.mask = 0;
-        node.setFirstChild(0);
-    }
-    node.material = material;
-    node.setFlags(material == 0 ? 0 : kSvoFlagSolid);
-}
-
-void Brick::collapse(std::uint32_t nodeIndex) {
-    SvoNode& node = m_nodes[nodeIndex];
-    if (!node.hasChildren() || node.mask != 0xFF) return;
-    const std::uint32_t firstChild = node.firstChild();
-    const SvoNode& first = m_nodes[firstChild];
-    // Only leaves are merged back. Merging two subtrees that merely look
-    // identical in their summary fields would silently discard real voxels.
-    if (first.hasChildren()) return;
-    for (std::uint32_t i = 1; i < 8; ++i) {
-        const SvoNode& candidate = m_nodes[firstChild + i];
-        if (candidate.hasChildren() || candidate.material != first.material ||
-            candidate.flags() != first.flags())
-            return;
-    }
-    const std::uint16_t material = first.material;
-    const std::uint8_t flags = first.flags();
-    releaseSubtree(firstChild);
-    node.mask = 0;
-    node.setFirstChild(0);
-    node.material = material;
-    node.setFlags(flags);
-}
-
-void Brick::collapseReachable() {
-    std::vector<std::uint32_t> order{0};
-    std::vector<std::uint32_t> visited;
-    visited.reserve(m_nodes.size());
-    while (!order.empty()) {
-        const std::uint32_t index = order.back();
-        order.pop_back();
-        visited.push_back(index);
-        const SvoNode& node = m_nodes[index];
-        if (node.hasChildren())
-            for (std::uint32_t i = 0; i < 8; ++i)
-                order.push_back(node.firstChild() + i);
-    }
-    for (auto it = visited.rbegin(); it != visited.rend(); ++it) collapse(*it);
-}
 
 std::uint16_t Brick::get(std::uint32_t x, std::uint32_t y,
                          std::uint32_t z) const {
-    const std::uint32_t edge = 1u << m_nodes[0].lodLevel;
+    const std::uint32_t edge = 1u << lodLevel();
     if (x >= edge || y >= edge || z >= edge) return 0;
     std::uint32_t nodeIndex = 0;
     std::uint32_t size = edge;
     for (;;) {
-        const SvoNode& node = m_nodes[nodeIndex];
-        if (!node.hasChildren()) return node.solid() ? node.material : 0;
+        const SvoNode& leaf = node(nodeIndex);
+        if (!leaf.hasChildren()) return leaf.solid() ? leaf.material : 0;
         const std::uint32_t half = size >> 1;
         const std::uint32_t kid =
             (x >= half ? 1u : 0u) | (y >= half ? 2u : 0u) | (z >= half ? 4u : 0u);
-        nodeIndex = node.firstChild() + kid;
+        nodeIndex = leaf.firstChild() + kid;
         size = half;
         if (kid & 1u) x -= half;
         if (kid & 2u) y -= half;
@@ -224,21 +169,24 @@ std::uint16_t Brick::get(std::uint32_t x, std::uint32_t y,
 
 void Brick::set(std::uint32_t x, std::uint32_t y, std::uint32_t z,
                 std::uint16_t material) {
-    const std::uint32_t edge = 1u << m_nodes[0].lodLevel;
+    const std::uint32_t edge = 1u << lodLevel();
     if (x >= edge || y >= edge || z >= edge) return;
     std::uint32_t nodeIndex = 0;
     std::uint32_t size = edge;
     for (;;) {
         if (size == 1) {
-            writeLeaf(nodeIndex, material);
+            writeLeaf(nodeIndex, material, material == 0 ? 0 : kSvoFlagSolid);
             break;
         }
-        SvoNode& node = m_nodes[nodeIndex];
-        if (!node.hasChildren()) split(nodeIndex);
+        // split() can grow the node vector, which reallocates it. A reference
+        // taken before the split would then read freed memory, so the child
+        // index is taken from a fresh lookup instead.
+        if (!node(nodeIndex).hasChildren()) split(nodeIndex);
+        const std::uint32_t firstChild = node(nodeIndex).firstChild();
         const std::uint32_t half = size >> 1;
         const std::uint32_t kid =
             (x >= half ? 1u : 0u) | (y >= half ? 2u : 0u) | (z >= half ? 4u : 0u);
-        nodeIndex = node.firstChild() + kid;
+        nodeIndex = firstChild + kid;
         size = half;
         if (kid & 1u) x -= half;
         if (kid & 2u) y -= half;
@@ -248,121 +196,15 @@ void Brick::set(std::uint32_t x, std::uint32_t y, std::uint32_t z,
     ++m_revision;
 }
 
-void Brick::fill(std::uint32_t minX, std::uint32_t minY, std::uint32_t minZ,
-                 std::uint32_t maxX, std::uint32_t maxY, std::uint32_t maxZ,
-                 std::uint16_t material) {
-    const std::uint32_t edge = 1u << m_nodes[0].lodLevel;
-    minX = std::min(minX, edge); minY = std::min(minY, edge);
-    minZ = std::min(minZ, edge); maxX = std::min(maxX, edge);
-    maxY = std::min(maxY, edge); maxZ = std::min(maxZ, edge);
-    if (minX >= maxX || minY >= maxY || minZ >= maxZ) return;
-
-    struct Work {
-        std::uint32_t node;
-        std::uint32_t x0, y0, z0, size;
-        std::uint32_t minX, minY, minZ, maxX, maxY, maxZ;
-    };
-    std::vector<Work> work;
-    work.push_back({0, 0, 0, 0, edge, minX, minY, minZ, maxX, maxY, maxZ});
-    while (!work.empty()) {
-        const Work current = work.back();
-        work.pop_back();
-        const bool intersects =
-            !(current.maxX <= current.x0 || current.maxY <= current.y0 ||
-              current.maxZ <= current.z0 ||
-              current.minX >= current.x0 + current.size ||
-              current.minY >= current.y0 + current.size ||
-              current.minZ >= current.z0 + current.size);
-        if (!intersects) continue;
-        const bool contains = current.minX <= current.x0 &&
-                              current.minY <= current.y0 &&
-                              current.minZ <= current.z0 &&
-                              current.maxX >= current.x0 + current.size &&
-                              current.maxY >= current.y0 + current.size &&
-                              current.maxZ >= current.z0 + current.size;
-        if (contains || current.size == 1) {
-            writeLeaf(current.node, material);
-            continue;
-        }
-        if (!m_nodes[current.node].hasChildren()) split(current.node);
-        const std::uint32_t half = current.size >> 1;
-        const std::uint32_t base = m_nodes[current.node].firstChild();
-        for (std::uint32_t i = 0; i < 8; ++i) {
-            work.push_back({base + i,
-                            current.x0 + ((i & 1u) ? half : 0u),
-                            current.y0 + ((i & 2u) ? half : 0u),
-                            current.z0 + ((i & 4u) ? half : 0u), half,
-                            current.minX, current.minY, current.minZ,
-                            current.maxX, current.maxY, current.maxZ});
-        }
-    }
-    collapseReachable();
-    ++m_revision;
-}
-
-void Brick::compact(std::vector<SvoNode>& nodes, SvoNode& rootNode) const {
-    // Breadth-first compaction. Only non-empty children are stored, and all
-    // children of one node are contiguous, so a node's eight fan-out costs
-    // `popcount(mask)` slots instead of a fixed eight. For surface-like data
-    // that is a large saving, because most boxes have a single occupied child.
-    const auto stored = [](const SvoNode& node) {
-        return node.hasChildren() || node.solid();
-    };
-
-    std::vector<std::uint32_t> level{0};
-    while (!level.empty()) {
-        std::vector<std::uint32_t> parents;
-        std::vector<std::uint32_t> childCount;
-        std::vector<std::uint32_t> next;
-        for (const std::uint32_t index : level) {
-            const SvoNode& source = m_nodes[index];
-            SvoNode copy = source;
-            if (source.hasChildren()) {
-                parents.push_back(static_cast<std::uint32_t>(nodes.size()));
-                const std::uint32_t first = source.firstChild();
-                std::uint8_t mask = 0;
-                std::uint32_t count = 0;
-                for (std::uint32_t i = 0; i < 8; ++i) {
-                    const SvoNode& child = m_nodes[first + i];
-                    if (!stored(child)) continue;
-                    mask |= static_cast<std::uint8_t>(1u << i);
-                    ++count;
-                    next.push_back(first + i);
-                }
-                childCount.push_back(count);
-                copy.material = 0;
-                copy.mask = mask;
-                if (count == 0) {
-                    copy.mask = 0;
-                    copy.setFirstChild(0);
-                    copy.setFlags(0);
-                }
-            }
-            nodes.push_back(copy);
-        }
-        const std::uint32_t childrenStart =
-            static_cast<std::uint32_t>(nodes.size());
-        std::uint32_t cumulative = 0;
-        for (std::size_t p = 0; p < parents.size(); ++p) {
-            nodes[parents[p]].setFirstChild(childrenStart + cumulative);
-            cumulative += childCount[p];
-        }
-        level = std::move(next);
-    }
-
-    if (nodes.empty()) {
-        rootNode = SvoNode{};
-        return;
-    }
-    rootNode = nodes.front();
-}
-
 // ---------------------------------------------------------------------------
 // World
 // ---------------------------------------------------------------------------
 
 World::World(WorldSpec spec, std::uint64_t seed)
-    : m_spec(spec), m_seed(seed),
+    : World(spec, seed, nullptr) {}
+
+World::World(WorldSpec spec, std::uint64_t seed, RegionStore* store)
+    : m_spec(spec), m_seed(seed), m_store(store),
       m_bricks(spec.rootCount(), Brick(brickLodLevel(spec.brick))) {
     if (m_spec.brick == 0 || (m_spec.brick & (m_spec.brick - 1)) != 0)
         throw std::invalid_argument("WorldSpec::brick must be a power of two");
@@ -409,6 +251,27 @@ Brick& World::ensure(std::uint32_t rootIndex) {
 }
 
 void World::generate(std::uint32_t rootIndex) {
+    // Regenerating into a brick that already holds a tree would interleave the
+    // new walk's blocks with the old one's freed ones, because both use the
+    // same allocator and the same indices. Starting from an empty brick keeps
+    // "this brick equals generate(index) plus its delta" true by construction.
+    m_bricks[rootIndex].reset();
+    buildProcedural(rootIndex, m_bricks[rootIndex]);
+    // Overlay the player's edits. This is the whole point of the provenance
+    // tree: the procedural walk is a pure function of the seed, and the delta
+    // is everything that makes this brick different from it.
+    if (m_store != nullptr) {
+        if (ProvenanceTree* delta = m_store->deltaFor(rootIndex)) {
+            delta->applyTo(m_bricks[rootIndex]);
+        }
+    }
+    // A freshly generated brick carries the world revision it was built from,
+    // so an edit anywhere bumps exactly the bricks that changed.
+    m_bricks[rootIndex].setRevision(m_revision);
+    m_bricks[rootIndex].markGenerated();
+}
+
+void World::buildProcedural(std::uint32_t rootIndex, Brick& brick) const {
     const std::uint32_t lod = brickLodLevel(m_spec.brick);
     const std::uint32_t edge = 1u << lod;
     const std::uint32_t dimX = m_spec.rootDimX();
@@ -485,32 +348,59 @@ void World::generate(std::uint32_t rootIndex) {
     std::uint16_t rootHigh = 0;
     rangeAt(0, 0, lod, rootLow, rootHigh);
 
-    Brick& brick = m_bricks[rootIndex];
     std::vector<Build> stack;
     stack.push_back({0, 0, 0, 0, lod, rootLow, rootHigh});
     while (!stack.empty()) {
         const Build current = stack.back();
         stack.pop_back();
         const std::uint32_t size = 1u << current.level;
-        const std::uint32_t top = current.z + size;
 
         std::uint16_t material = 0;
         bool uniform = false;
+        // A box is uniform only when *every* cell in it gets the same
+        // material. The height mipmap gives the two column-top extremes in
+        // the box, which settles the common cases in O(1): above `high` it is
+        // all air, and a box whose world z lies entirely in the lava band is
+        // all lava.
+        //
+        // The remaining case is decided the same way, but only after the mipmap
+        // has proved the box homogeneous: `low == high` means every column in
+        // the box shares one surface height, so the strata really are a pure
+        // function of z across the whole box and the centre column speaks for
+        // all of it. Only then are its two face values allowed to decide.
+        //
+        // Without that test the centre column spoke for boxes that spanned a
+        // slope, and any such box was collapsed to a single flat-topped slab --
+        // carving the terrain away in chunks, which is what was reported.
+        //
+        // Note the lava band is a *world* z band, so this comparison (and the
+        // one below) shifts by originZ. Reading it as a brick-local z repeats
+        // the bands at the floor of every brick.
+        const std::int32_t worldZ = static_cast<std::int32_t>(originZ) +
+                                    static_cast<std::int32_t>(current.z);
+        const std::int32_t worldTop = worldZ + static_cast<std::int32_t>(size);
+        const auto lavaBand = static_cast<std::int32_t>(kLavaBand);
+        const bool homogeneous = current.low == current.high;
         if (current.z >= current.high) {
             uniform = true;   // strictly above every column top
-        } else if (top <= kLavaBand) {
-            uniform = true;
-            material = kLavaId;
-        } else if (current.z >= kLavaBand && top + kDirtBand <= current.low) {
-            uniform = true;
-            material = kStoneId;
-        } else if (current.z >= kLavaBand + kDirtBand && top + 1 <= current.low) {
-            uniform = true;
-            material = kDirtId;
+        } else if (homogeneous) {
+            const auto cx = static_cast<std::int32_t>(originX + current.x);
+            const auto cy = static_cast<std::int32_t>(originY + current.y);
+            const std::uint32_t columnTop =
+                terrainTop(cx, cy, static_cast<std::uint32_t>(m_spec.sizeZ));
+            const std::uint16_t bottom =
+                terrainMaterial(cx, cy, worldZ, columnTop);
+            const std::uint16_t ceiling =
+                terrainMaterial(cx, cy, worldTop - 1, columnTop);
+            if (bottom == ceiling) {
+                uniform = true;
+                material = bottom;
+            }
         }
 
         if (uniform) {
-            brick.writeLeaf(current.node, material);
+            brick.writeLeaf(current.node, material,
+                            material == 0 ? 0 : kSvoFlagSolid);
             continue;
         }
         if (current.level == 0) {
@@ -518,7 +408,9 @@ void World::generate(std::uint32_t rootIndex) {
             const std::int32_t wy = static_cast<std::int32_t>(originY + current.y);
             const std::int32_t wz = static_cast<std::int32_t>(originZ + current.z);
             const std::uint32_t columnTop = terrainTop(wx, wy, maxZ);
-            brick.writeLeaf(current.node, terrainMaterial(wx, wy, wz, columnTop));
+            const std::uint16_t atCell = terrainMaterial(wx, wy, wz, columnTop);
+            brick.writeLeaf(current.node, atCell,
+                            atCell == 0 ? 0 : kSvoFlagSolid);
             continue;
         }
 
@@ -535,10 +427,6 @@ void World::generate(std::uint32_t rootIndex) {
         }
     }
     brick.collapseReachable();
-    // A freshly generated brick carries the world revision it was built from,
-    // so an edit anywhere bumps exactly the bricks that changed.
-    brick.setRevision(m_revision);
-    brick.markGenerated();
 }
 
 std::uint16_t World::get(std::int32_t x, std::int32_t y, std::int32_t z) {
@@ -558,13 +446,63 @@ bool World::isSolid(std::int32_t x, std::int32_t y, std::int32_t z) {
 void World::set(std::int32_t x, std::int32_t y, std::int32_t z,
                 std::uint16_t material) {
     if (!inBounds(x, y, z)) return;
-    Brick& brick = ensure(rootIndexOfCell(x, y, z));
+    const std::uint32_t rootIndex = rootIndexOfCell(x, y, z);
+    Brick& brick = ensure(rootIndex);
     const std::uint32_t bx = static_cast<std::uint32_t>(x) & (m_spec.brick - 1);
     const std::uint32_t by = static_cast<std::uint32_t>(y) & (m_spec.brick - 1);
     const std::uint32_t bz = static_cast<std::uint32_t>(z) & (m_spec.brick - 1);
+    // Read what is there before writing. For a cell that has never been edited
+    // this is exactly what the generator alone produced, which is the only
+    // reliable way to tell whether an override is still doing any work:
+    // re-deriving it from terrainTop()/terrainMaterial() would have to
+    // duplicate the generator's box-uniformity rules, which are what actually
+    // decide the cell's material.
+    const std::uint16_t previous = brick.get(bx, by, bz);
     brick.set(bx, by, bz, material);
+    if (m_store != nullptr) recordEdit(rootIndex, bx, by, bz, material, previous);
     ++m_revision;
     brick.setRevision(m_revision);
+}
+
+std::uint16_t World::proceduralValue(std::uint32_t rootIndex, std::uint32_t bx,
+                                     std::uint32_t by,
+                                     std::uint32_t bz) const {
+    // What the generator alone puts in this cell, with no player edits.
+    //
+    // This deliberately regenerates rather than calling terrainMaterial()
+    // directly. The generator decides a cell's material from its *box*
+    // uniformity tests (the min/max height mipmap), and those are not
+    // reducible to a per-cell function. Asking the generator is the only way
+    // to get the answer the world actually agrees with.
+    //
+    // Only reached when an override already exists at this cell, so the common
+    // "dig into untouched terrain" path costs nothing.
+    Brick scratch(brickLodLevel(m_spec.brick));
+    buildProcedural(rootIndex, scratch);
+    return scratch.get(bx, by, bz);
+}
+
+void World::recordEdit(std::uint32_t rootIndex, std::uint32_t bx,
+                       std::uint32_t by, std::uint32_t bz,
+                       std::uint16_t material, std::uint16_t previous) {
+    ProvenanceTree* tree = m_store->deltaForEdit(rootIndex);
+    if (tree == nullptr) return;
+    tree->setRevision(m_revision + 1);
+
+    // Prune when the cell ends up holding exactly what the generator produces.
+    // Without this, digging a hole and refilling it would leave the cells on
+    // disk forever, so the save would track churn instead of net change.
+    //
+    // `previous` is the pristine value unless this cell already carries an
+    // override, in which case the generator has to be asked directly.
+    const bool hadOverride = tree->query(bx, by, bz) != nullptr;
+    const std::uint16_t pristine =
+        hadOverride ? proceduralValue(rootIndex, bx, by, bz) : previous;
+    if (material == pristine) {
+        tree->clearCell(bx, by, bz);
+        return;
+    }
+    tree->overrideCell(bx, by, bz, material);
 }
 
 void World::fill(std::int32_t minX, std::int32_t minY, std::int32_t minZ,
@@ -590,6 +528,23 @@ void World::snapshot(std::uint32_t rootIndex, std::uint32_t& revision,
                      SvoNode& rootNode, std::vector<SvoNode>& nodes) {
     revision = ensure(rootIndex).revision();
     m_bricks[rootIndex].compact(nodes, rootNode);
+}
+
+void World::snapshotLod(std::uint32_t rootIndex, std::uint8_t leafLevel,
+                        std::uint32_t& revision, SvoNode& rootNode,
+                        std::vector<SvoNode>& nodes) {
+    Brick& brick = ensure(rootIndex);
+    revision = brick.revision();
+
+    const std::uint8_t rootLevel = brickLodLevel(m_spec.brick);
+    if (leafLevel >= rootLevel) {
+        brick.compact(nodes, rootNode);
+        return;
+    }
+
+    // Reduce from the full-resolution tree. The reduction is derived, not
+    // generated: it is a rewrite of what the generator already produced.
+    reduceToLevel(brick, leafLevel, nodes, rootNode);
 }
 
 std::uint32_t World::brickRevision(std::uint32_t rootIndex) {

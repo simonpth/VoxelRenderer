@@ -24,7 +24,7 @@ void sleepMs(int ms) {
 
 int main() {
     // Use an uncommon port pair so a stale run cannot collide.
-    const std::uint16_t port = 28431;
+    const std::uint16_t port = 28777;
     const WorldSpec spec{1024, 1024, 256, 128};
 
     {
@@ -82,6 +82,38 @@ int main() {
             std::printf("second server did not start\n");
             return 1;
         }
+        server.stop();
+    }
+
+    // A second client must be served while the first is still connected:
+    // the listener may only reap *finished* stream threads, never join a
+    // live one.
+    {
+        Server server(port, spec, 0xC0FFEE);
+        server.start();
+        if (!server.running()) {
+            std::printf("third server did not start\n");
+            return 1;
+        }
+        Client first(Peer{"127.0.0.1", port});
+        Client second(Peer{"127.0.0.1", port});
+        first.start();
+        for (int i = 0; i < 200 && !first.renderState().sizeX; ++i) sleepMs(20);
+        if (first.renderState().sizeX != spec.sizeX) {
+            std::printf("first client got no descriptor\n");
+            return 1;
+        }
+        // The first client is still connected here.
+        second.start();
+        for (int i = 0; i < 100 && !second.renderState().sizeX; ++i)
+            sleepMs(20);
+        if (second.renderState().sizeX != spec.sizeX) {
+            std::printf("second client timed out while the first held a stream\n");
+            return 1;
+        }
+        std::printf("concurrent streams: both served\n");
+        second.stop();
+        first.stop();
         server.stop();
     }
 

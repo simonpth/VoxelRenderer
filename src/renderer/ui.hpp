@@ -16,6 +16,9 @@ struct UIData {
     std::string playerPosition;
     std::string playerVelocity;
     std::string viewDirection;
+    // Mirrors the authority's flight mode so the HUD cannot claim a state the
+    // server does not agree with.
+    bool flying = false;
 };
 
 class UI {
@@ -45,14 +48,17 @@ private:
     std::array<char, 64> m_playerPositionBuffer{};
     std::array<char, 64> m_playerVelocityBuffer{};
     std::array<char, 64> m_viewDirectionBuffer{};
+    std::array<char, 32> m_flightModeBuffer{};
     int m_playerPositionLength = 0;
     int m_playerVelocityLength = 0;
     int m_viewDirectionLength = 0;
+    int m_flightModeLength = 0;
     float m_displayedFps = -1.0f;
     float m_displayedHealth = -1.0f;
     std::string m_displayedPlayerPosition;
     std::string m_displayedPlayerVelocity;
     std::string m_displayedViewDirection;
+    bool m_displayedFlying = false;
     uint32_t m_displayedWidth = 0;
     uint32_t m_displayedHeight = 0;
     bool m_initialized = false;

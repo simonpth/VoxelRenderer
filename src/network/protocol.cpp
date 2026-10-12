@@ -100,6 +100,7 @@ void player(std::vector<std::byte>& out, const PlayerState& value) {
     f32(out, value.yaw);
     f32(out, value.pitch);
     out.push_back(std::byte(value.grounded ? 1 : 0));
+    out.push_back(std::byte(value.flying ? 1 : 0));
 }
 bool vec2(std::span<const std::byte> in, std::size_t& at, glm::vec2& value) {
     return f32(in, at, value.x) && f32(in, at, value.y);
@@ -109,11 +110,14 @@ bool vec3(std::span<const std::byte> in, std::size_t& at, glm::vec3& value) {
 }
 bool player(std::span<const std::byte> in, std::size_t& at, PlayerState& value) {
     std::byte grounded = std::byte(0);
+    std::byte flying = std::byte(0);
     if (!u32(in, at, value.id) || !vec3(in, at, value.position) ||
         !vec3(in, at, value.velocity) || !f32(in, at, value.yaw) ||
-        !f32(in, at, value.pitch) || !read(in, at, &grounded, 1))
+        !f32(in, at, value.pitch) || !read(in, at, &grounded, 1) ||
+        !read(in, at, &flying, 1))
         return false;
     value.grounded = std::to_integer<unsigned>(grounded) != 0;
+    value.flying = std::to_integer<unsigned>(flying) != 0;
     return true;
 }
 
@@ -138,9 +142,11 @@ std::vector<std::byte> encode(const InputIntent& message) {
     std::vector<std::byte> out;
     header(out, PacketKind::Intent);
     u32(out, message.clientTick);
-    vec2(out, message.move);
+    vec2(out, message.moveDirection);
     vec2(out, message.look);
     out.push_back(std::byte(message.jumpPressed ? 1 : 0));
+    out.push_back(std::byte(message.descendPressed ? 1 : 0));
+    out.push_back(std::byte(message.flying ? 1 : 0));
     return out;
 }
 
@@ -204,6 +210,15 @@ std::vector<std::byte> encode(const WorldAck& message) {
     return out;
 }
 
+std::vector<std::byte> encode(const WorldForget& message) {
+    std::vector<std::byte> out;
+    header(out, PacketKind::WorldForget);
+    uuid(out, message.uuid);
+    u32(out, message.playerId);
+    u32(out, message.rootIndex);
+    return out;
+}
+
 std::vector<std::byte> encode(const BrickSnapshot& message) {
     if (message.nodes.empty() || message.nodes.size() > kMaxBrickNodes) return {};
     std::vector<std::byte> out;
@@ -237,14 +252,31 @@ bool decode(std::span<const std::byte> in, RegistrationAck& message) {
 bool decode(std::span<const std::byte> in, InputIntent& message) {
     std::size_t at = 0;
     std::byte jump = std::byte(0);
+    std::byte descend = std::byte(0);
+    std::byte flying = std::byte(0);
     if (!begin(in, at, PacketKind::Intent) || !u32(in, at, message.clientTick) ||
-        !vec2(in, at, message.move) || !vec2(in, at, message.look) ||
-        !read(in, at, &jump, 1))
+        !vec2(in, at, message.moveDirection) || !vec2(in, at, message.look) ||
+        !read(in, at, &jump, 1) || !read(in, at, &descend, 1) ||
+        !read(in, at, &flying, 1))
         return false;
     message.jumpPressed = std::to_integer<unsigned>(jump) != 0;
-    return at == in.size() &&
-           std::abs(message.move.x) <= 1.0f && std::abs(message.move.y) <= 1.0f &&
-           std::abs(message.look.x) <= 0.5f && std::abs(message.look.y) <= 0.5f;
+    message.descendPressed = std::to_integer<unsigned>(descend) != 0;
+    message.flying = std::to_integer<unsigned>(flying) != 0;
+    // Look travels in degrees per intent: a fast flick has to survive the
+    // round trip, a corrupt value still has to be refused.
+    if (!(at == in.size() &&
+          std::abs(message.look.x) <= voxel::kMaxLookDegrees &&
+          std::abs(message.look.y) <= voxel::kMaxLookDegrees))
+        return false;
+    // The direction is clamped rather than range-checked. A vector longer than
+    // 1 is not corrupt -- it is exactly what a diagonal key combination
+    // produces, and what a client whose basis has drifted produces -- so it is
+    // scaled to full speed instead of being refused. Refusing it would also
+    // work, but clamping keeps the authority's speed a function of one thing
+    // only: its own kMoveSpeed.
+    const float length = glm::length(message.moveDirection);
+    if (length > 1.0f) message.moveDirection /= length;
+    return true;
 }
 
 bool decode(std::span<const std::byte> in, AuthoritativeState& message) {
@@ -312,6 +344,13 @@ bool decode(std::span<const std::byte> in, WorldAck& message) {
            uuid(in, at, message.uuid) && u32(in, at, message.playerId) &&
            u32(in, at, message.rootIndex) && u32(in, at, message.revision) &&
            at == in.size();
+}
+
+bool decode(std::span<const std::byte> in, WorldForget& message) {
+    std::size_t at = 0;
+    return begin(in, at, PacketKind::WorldForget) &&
+           uuid(in, at, message.uuid) && u32(in, at, message.playerId) &&
+           u32(in, at, message.rootIndex) && at == in.size();
 }
 
 bool decode(std::span<const std::byte> in, BrickSnapshot& message) {

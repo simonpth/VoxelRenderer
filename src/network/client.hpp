@@ -7,6 +7,7 @@
 #include <random>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "protocol.hpp"
@@ -40,6 +41,9 @@ class Client {
     // Called once per render frame with the raw local input.
     void submit(const InputIntent& intent, float frameSeconds);
     void updateRender(float frameSeconds);
+    // Call after the renderer has drawn, so acknowledgements reflect bricks
+    // that really reached the GPU pool rather than bricks merely received.
+    void confirmUploads();
     RenderState& renderState() { return m_render; }
     const RenderState& renderState() const { return m_render; }
     const AuthoritativeState& authoritativeState() const {
@@ -57,7 +61,14 @@ class Client {
     struct Resident {
         std::uint32_t revision = 0;
     };
-    void receiveLoop();
+    // Bound on bricks waiting for the GPU. Beyond this the client stops
+    // accepting frames rather than dropping ones it has already recorded.
+    static constexpr std::size_t kMaxPendingBricks = 256;
+    // Headroom above the upload bound for pending frees, which carry no voxel
+    // data. Eviction has to be lossless -- an unprocessed free leaks the GPU
+    // slice the entry still owns -- so a big window shift is allowed to queue
+    // a little past the limit rather than dropping any of it.
+    static constexpr std::size_t kMaxEvictionSlack = 256;    void receiveLoop();
     void worldReceiveLoop();
     void acceptSnapshot(AuthoritativeState snapshot);
     void enqueueBrick(BrickSnapshot snapshot);
@@ -82,6 +93,23 @@ class Client {
     std::deque<AuthoritativeState> m_snapshots;
     std::deque<BrickSnapshot> m_worldQueue;
     std::vector<WorldAck> m_pendingAcks;
+    // rootIndex -> revision waiting for the renderer to confirm the upload.
+    // An ack is only queued from here, once the renderer reports success.
+    std::unordered_map<std::uint32_t, std::uint32_t, RegionKeyHash>
+        m_awaitingUpload;
+    bool m_uploadOverflow = false;
+    // How many entries in the render queue are pending frees rather than
+    // uploads. Tracked so the upload bound can be applied to uploads alone.
+    std::size_t m_evictionBacklog = 0;
+    // Pending frees by root index, so the backlog can be retired exactly as
+    // the renderer reports them rather than guessed at.
+    std::unordered_set<std::uint32_t> m_pendingFrees;
+    // Roots the renderer evicted from its bounded arena. Each becomes a
+    // WorldForget on the next stream pass, which is the only thing that makes
+    // the server resend an evicted brick: without it, the delivery record
+    // says "already sent" and the brick is missing for the rest of the
+    // session -- an eviction would be permanent.
+    std::vector<std::uint32_t> m_pendingForgets;
     std::unordered_map<std::uint32_t, Resident, RegionKeyHash> m_resident;
     std::int32_t m_interestX = 0;
     std::int32_t m_interestY = 0;
@@ -99,6 +127,9 @@ class Client {
     float m_localPitch = 0.0f;
     glm::vec2 m_accumulatedLook{0.0f};
     std::uint32_t m_latestClientTick = 0;
+    // Last intent the server has been sent, used to tell whether a snapshot
+    // already acknowledges every look the client applied locally.
+    std::uint32_t m_sentClientTick = 0;
     bool m_jumpRequested = false;
     ClientUuid m_uuid{};
     bool m_registered = false;

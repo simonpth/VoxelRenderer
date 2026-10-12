@@ -24,6 +24,10 @@ namespace voxel {
 
 inline constexpr std::uint8_t kSvoFlagSolid = 1u << 0;
 inline constexpr std::uint8_t kSvoFlagResident = 1u << 1;
+// Provenance trees only: this leaf's material is an override of the
+// procedural generator rather than a value the generator produced. The
+// voxel octree never sets it and the shader never reads it.
+inline constexpr std::uint8_t kSvoFlagDelta = 1u << 2;
 
 struct alignas(8) SvoNode {
     std::uint32_t word0 = 0;

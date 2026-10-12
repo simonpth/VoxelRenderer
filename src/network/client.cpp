@@ -147,6 +147,7 @@ void Client::worldReceiveLoop() {
     while (m_running.load() && m_worldSocket.valid()) {
         WorldInterest interest{};
         std::vector<WorldAck> acks;
+        std::vector<std::uint32_t> forgets;
         bool sendInterest = false;
         {
             std::scoped_lock lock(m_mutex);
@@ -187,10 +188,19 @@ void Client::worldReceiveLoop() {
                 }
             }
             acks.swap(m_pendingAcks);
+            forgets.swap(m_pendingForgets);
         }
         if (sendInterest && !m_worldSocket.sendFrame(encode(interest))) return;
         for (const WorldAck& ack : acks)
             if (!m_worldSocket.sendFrame(encode(ack))) return;
+        // A forget is only queued for a brick that was evicted and not
+        // re-placed in the same frame -- `confirmUploads` excludes those --
+        // so nothing here can retract a delivery the client still stands
+        // behind.
+        for (std::uint32_t rootIndex : forgets)
+            if (!m_worldSocket.sendFrame(encode(WorldForget{
+                    m_uuid, m_playerId, rootIndex})))
+                return;
 
         if (!m_worldSocket.pollReadable(kWaitMs)) continue;
         if (!m_worldSocket.receiveFrame(frame)) return;
@@ -205,24 +215,115 @@ void Client::enqueueBrick(BrickSnapshot snapshot) {
     if (spec.rootCount() == 0 || snapshot.rootIndex >= spec.rootCount())
         return;
     std::scoped_lock lock(m_mutex);
-    const auto found = m_resident.find(snapshot.rootIndex);
-    if (found != m_resident.end() && found->second.revision == snapshot.revision)
-        return;   // already held at this revision
+
+    // Three ways a frame can be redundant, and they are not the same thing:
+    //
+    //  * Already in the GPU pool at this revision: nothing to do. This is the
+    //    only case that may drop the frame outright.
+    //  * Queued or in flight: the server resent something we have not finished
+    //    with. Dropping it is right, but it must *not* be treated as delivered.
+    //  * Evicted and back: accepted again, which is the whole point of the
+    //    server purging its record outside the interest window.
+    //
+    // An earlier version recorded "resident" the moment a brick was *queued*.
+    // If the node pool then refused it, the entry was gone but the record
+    // remained, so the resend was dismissed as a duplicate forever: the client
+    // waited for an upload that could not arrive and the server waited for an
+    // ack that was never coming.
+    const auto resident = m_resident.find(snapshot.rootIndex);
+    if (resident != m_resident.end() &&
+        resident->second.revision == snapshot.revision)
+        return;
+    const auto inFlight = m_awaitingUpload.find(snapshot.rootIndex);
+    if (inFlight != m_awaitingUpload.end() &&
+        inFlight->second == snapshot.revision)
+        return;
+
+    // Back-pressure, not a silent drop. The queue is bounded so a stalled
+    // render thread cannot grow the heap without limit -- but the old code
+    // satisfied that bound by *discarding* the oldest updates, which had
+    // already been marked resident and acknowledged. The server then saw the
+    // ack, stopped resending, and those bricks were never uploaded at all, so
+    // they stayed magenta for the rest of the session. A brick that has been
+    // received but not queued is simply never acknowledged, which makes the
+    // server retry it on its next pass.
+    if (m_render.bricks.size() >= kMaxPendingBricks) {
+        m_uploadOverflow = true;
+        return;
+    }
 
     voxel::BrickUpdate update{};
     update.rootIndex = snapshot.rootIndex;
     update.revision = snapshot.revision;
+    // Carried through so the renderer can tell a full-resolution brick from a
+    // reduced one, and so a test can see what the server actually shipped.
+    update.lodLevel = snapshot.lodLevel;
     update.nodes = std::move(snapshot.nodes);
     m_render.bricks.push_back(std::move(update));
-    m_resident[snapshot.rootIndex].revision = snapshot.revision;
-    m_pendingAcks.push_back(WorldAck{m_uuid, snapshot.playerId,
-                                     snapshot.rootIndex, snapshot.revision});
-    // Bounded queue: a slow render thread must not grow the client heap.
-    while (m_render.bricks.size() > 256) m_render.bricks.erase(m_render.bricks.begin());
+    // Not acknowledged here. The ack waits for the renderer to report the
+    // upload in `confirmUploads`, so the server's idea of what we hold cannot
+    // outrun what is actually on the GPU.
+    m_awaitingUpload.emplace(snapshot.rootIndex, snapshot.revision);
+}
+
+void Client::confirmUploads() {
+    std::scoped_lock lock(m_mutex);
+
+    // The revision a brick was uploaded at. Taken before the in-flight set is
+    // cleared below, since that is where the revision is still known.
+    std::unordered_map<std::uint32_t, std::uint32_t, RegionKeyHash> confirmed;
+    for (std::uint32_t rootIndex : m_render.uploadedRoots) {
+        const auto pending = m_awaitingUpload.find(rootIndex);
+        if (pending == m_awaitingUpload.end()) continue;   // evicted meanwhile
+        confirmed.emplace(rootIndex, pending->second);
+    }
+
+    // Evictions the renderer made to fit something else. A brick here was
+    // acknowledged once and then thrown away, so it is no longer held -- the
+    // record must go or the next resend is dismissed as a duplicate.
+    //
+    // One case is deliberately excluded: a brick evicted and re-placed in the
+    // same frame. The renderer evicts while processing the queue in order, so
+    // a brick dropped for an earlier update can be re-uploaded by a later one,
+    // and it then appears in `uploadedRoots` too. It is resident, so it is
+    // acknowledged and not forgotten; forgetting it would only cost a
+    // redundant resend.
+    for (std::uint32_t rootIndex : m_render.evictedRoots) {
+        if (confirmed.find(rootIndex) != confirmed.end()) continue;
+        m_resident.erase(rootIndex);
+        m_awaitingUpload.erase(rootIndex);
+        m_pendingForgets.push_back(rootIndex);
+    }
+
+    // Only a brick the renderer placed in the pool is recorded as held and
+    // acknowledged. This is the sole source of both facts.
+    for (const auto& [rootIndex, revision] : confirmed) {
+        m_resident[rootIndex].revision = revision;
+        m_pendingAcks.push_back(WorldAck{m_uuid, m_playerId, rootIndex, revision});
+    }
+
+    // Everything the renderer finished with is no longer queued, so nothing
+    // awaits an upload that will never arrive -- including bricks it refused.
+    // Clearing these is what keeps a refused brick eligible for the server's
+    // next resend rather than dismissing it as a duplicate forever.
+    for (std::uint32_t rootIndex : m_render.processedRoots) {
+        m_awaitingUpload.erase(rootIndex);
+        // Frees carry no data, so they are tracked by index and retired as
+        // soon as the renderer reports them. This keeps the upload bound
+        // accounting for uploads alone.
+        if (m_pendingFrees.erase(rootIndex) > 0 && m_evictionBacklog > 0)
+            --m_evictionBacklog;
+    }
+
+    m_render.processedRoots.clear();
+    m_render.uploadedRoots.clear();
+    m_render.evictedRoots.clear();
 }
 
 void Client::submit(const InputIntent& intent, float frameSeconds) {
     std::scoped_lock lock(m_mutex);
+    // For convenience the caller may hand raw keys instead of an intent; they
+    // are resolved below against the local camera basis.
     m_registrationRetry -= frameSeconds;
     m_inputAccumulator += frameSeconds;
     if (!m_registered && m_registrationRetry <= 0.0f) {
@@ -230,34 +331,62 @@ void Client::submit(const InputIntent& intent, float frameSeconds) {
         m_registrationRetry = 0.5f;
     }
 
-    // Raw intent only. The server computes displacement from its own yaw, so
-    // no client-side movement maths ever reaches the wire.
-    const glm::vec2 move = glm::clamp(intent.move, glm::vec2(-1.0f),
+    // Resolve the keys into a world direction here, because this is the only side
+    // that knows which way the screen is facing. The renderer builds its basis
+    // from the same `m_localYaw` (see VulkanContext::drawFrame), so the
+    // direction that moves the player is derived from the direction that draws
+    // it -- there is no second copy of this maths anywhere, which is what the
+    // old path got wrong: the authority rebuilt the basis from its own
+    // replicated `yaw`, and the two disagreed whenever a look input was still
+    // in flight, so W walked off in a direction the screen did not show.
+    //
+    // `m_localYaw` is the *predicted* yaw, updated below from this frame's look
+    // first, so the direction uses the yaw the player is actually rendering
+    // this frame rather than the last one the server confirmed.
+    m_localYaw += intent.look.x;
+    while (m_localYaw > 180.0f) m_localYaw -= 360.0f;
+    while (m_localYaw < -180.0f) m_localYaw += 360.0f;
+
+    const glm::vec2 move = glm::clamp(intent.rawMove.axes, glm::vec2(-1.0f),
                                       glm::vec2(1.0f));
+    // Yaw is degrees on the wire, radians here, matching the renderer exactly.
+    const float yaw = glm::radians(m_localYaw);
+    const glm::vec2 forward{std::cos(yaw), std::sin(yaw)};
+    // right = cross(forward, up) with up = +Z, which on the ground plane is
+    // (forward.y, -forward.x). This is the renderer's basis, not a new one.
+    const glm::vec2 right{forward.y, -forward.x};
+    // Not normalised here: the magnitude carries how much of the movement is
+    // held (W alone is full speed, W+D is still full speed but diagonal). The
+    // authority normalises a diagonal so it cannot outrun a single axis.
+    const glm::vec2 direction = forward * move.y + right * move.x;
     m_accumulatedLook += intent.look;
-    m_accumulatedLook = glm::clamp(m_accumulatedLook, glm::vec2(-0.5f),
-                                   glm::vec2(0.5f));
+    m_accumulatedLook = glm::clamp(m_accumulatedLook,
+                                   glm::vec2(-voxel::kMaxLookDegrees),
+                                   glm::vec2(voxel::kMaxLookDegrees));
     m_latestClientTick = intent.clientTick;
     m_jumpRequested = m_jumpRequested || intent.jumpPressed;
 
     if (m_registered && m_inputAccumulator >= voxel::kTickSeconds) {
         InputIntent out{};
         out.clientTick = m_latestClientTick;
-        out.move = move;
+        out.moveDirection = direction;
         out.look = m_accumulatedLook;
         out.jumpPressed = m_jumpRequested;
+        // The requested flight mode travels as intent: the authority owns the
+        // applied state and mails it back in the snapshot.
+        out.flying = intent.flying;
+        out.descendPressed = intent.descendPressed;
         if (m_socket.send(encode(out), m_server)) {
             m_inputAccumulator -= voxel::kTickSeconds;
             m_accumulatedLook = glm::vec2(0.0f);
             m_jumpRequested = false;
+            m_sentClientTick = out.clientTick;
         }
     }
 
+    // Yaw was already folded in above, before the direction was resolved from it.
     // Look stays local for responsiveness; the snapshot still carries the
     // authoritative orientation for everyone else.
-    m_localYaw += intent.look.x;
-    while (m_localYaw > 180.0f) m_localYaw -= 360.0f;
-    while (m_localYaw < -180.0f) m_localYaw += 360.0f;
     m_localPitch = std::clamp(m_localPitch + intent.look.y, -89.0f, 89.0f);
     m_render.localPlayer.yaw = m_localYaw;
     m_render.localPlayer.pitch = m_localPitch;
@@ -289,37 +418,35 @@ void Client::updateRender(float frameSeconds) {
         m_clock = 0.0f;
     }
 
-    // Evict bricks that fell out of the interest window. The renderer frees
-    // their GPU slice and clears the root table entry.
+    // Publish the interest window. The renderer uses it to decide what it is
+    // willing to evict: a brick inside the window is never the first thing
+    // thrown away to make room for one from across the world.
+    //
+    // Note what is *not* here any more: this used to evict every brick that
+    // fell outside the window, on the grounds that the player cannot see it.
+    // That is wrong once the client is allowed to hold a budget larger than the
+    // window -- which is the whole point of a 3 GiB arena on a world that fits
+    // in a few hundred megabytes. Evicting on window exit meant the cache was
+    // always exactly one window deep, so streaming the rest of the world was
+    // pointless: every brick sent was thrown away before it could be used, and
+    // the player re-downloaded the ground they had already walked over on every
+    // step. Retention is now the arena's decision, by capacity; this is only
+    // about priority.
     if (m_hasSpec && m_hasInterest) {
-        const std::int32_t brick = static_cast<std::int32_t>(m_spec.brick);
-        const std::int32_t dimX = static_cast<std::int32_t>(m_spec.rootDimX());
-        const std::int32_t dimY = static_cast<std::int32_t>(m_spec.rootDimY());
-        const std::int32_t cx = m_interestX / brick;
-        const std::int32_t cy = m_interestY / brick;
-        const std::int32_t cz = m_interestZ / brick;
-        const std::int32_t radius = static_cast<std::int32_t>(m_interestRadius);
-        for (auto it = m_resident.begin(); it != m_resident.end();) {
-            const std::int32_t bx = static_cast<std::int32_t>(it->first % dimX);
-            const std::int32_t by = static_cast<std::int32_t>(
-                (it->first / dimX) % dimY);
-            const std::int32_t bz = static_cast<std::int32_t>(
-                it->first / (dimX * dimY));
-            const std::int32_t distance = std::max(
-                {std::abs(bx - cx), std::abs(by - cy), std::abs(bz - cz)});
-            if (distance > radius) {
-                voxel::BrickUpdate update{};
-                update.rootIndex = it->first;
-                update.remove = true;
-                m_render.bricks.push_back(std::move(update));
-                it = m_resident.erase(it);
-            } else {
-                ++it;
-            }
-        }
+        m_render.interestX = m_interestX;
+        m_render.interestY = m_interestY;
+        m_render.interestZ = m_interestZ;
+        m_render.interestRadius = m_interestRadius;
     }
 
     m_clock = std::min(m_clock + frameSeconds, voxel::kTickSeconds);
+    // Once the authority has consumed every intent the client sent, adopt its
+    // yaw. The local look only ever previews the server, so a clamped or lost
+    // intent cannot leave the camera facing somewhere the server is not, which
+    // is the direction movement is resolved in.
+    if (m_sentClientTick != 0 &&
+        m_authoritative.acknowledgedInputTick >= m_sentClientTick)
+        m_localYaw = m_authoritative.localPlayer.yaw;
     m_render.localPlayer = m_authoritative.localPlayer;
     m_render.localPlayer.yaw = m_localYaw;
     m_render.localPlayer.pitch = m_localPitch;

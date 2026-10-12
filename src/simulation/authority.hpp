@@ -37,6 +37,12 @@ class Authority {
     AuthoritativeState m_state;
     World& m_world;
     glm::vec2 m_wishMove{0.0f};   // accumulated per-tick walk intent
+    // Flight state the authority resolved itself: the requested mode plus the
+    // two vertical keys, held across ticks the server replayed with no fresh
+    // intent in them.
+    bool m_flyingRequested = false;
+    bool m_ascendHeld = false;
+    bool m_descendHeld = false;
 };
 
 } // namespace voxel

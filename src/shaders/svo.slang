@@ -25,6 +25,11 @@ static const uint kMaterialEmissive = 2u;
 
 // Rendered when a ray reaches a brick the client has not streamed yet.
 static const float3 kUnknownColor = float3(0.55f, 0.0f, 0.55f);
+// Sentinel material meaning "this ray never resolved because data is missing",
+// as distinct from material 0, which means "resolved, and it is air". Every
+// consumer must distinguish the two: treating unknown as air turns a loading
+// gap into a hole you can see through.
+static const uint kUnknownMaterial = 0xFFFFu;
 static const float3 kSkyZenith = float3(0.06f, 0.22f, 0.55f);
 static const float3 kSkyHorizon = float3(0.42f, 0.68f, 0.95f);
 

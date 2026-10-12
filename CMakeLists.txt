@@ -191,6 +191,12 @@ add_executable(VoxelRenderer
 	src/renderer/vulkancontext.cpp
 	src/renderer/ui.cpp
 	src/simulation/authority.cpp
+	src/simulation/octree.cpp
+	src/simulation/provenance.cpp
+	src/simulation/region.cpp
+	src/simulation/lod.cpp
+	src/simulation/lod_rings.cpp
+	src/simulation/brick_pool.cpp
 	src/simulation/svo.cpp
 	src/network/protocol.cpp
 	src/network/udp_socket.cpp
@@ -249,9 +255,30 @@ endif()
 
 if(VOXEL_BUILD_TESTS)
 	enable_testing()
+
+	# Tests are written with assert() and are worthless if it is compiled out.
+	# A release build type adds -DNDEBUG globally, which would leave every
+	# target below "passing" while checking nothing -- a failure mode that is
+	# invisible precisely because ctest still reports success.
+	#
+	# This is worth being explicit about: the whole suite was silently inert
+	# under the default RelWithDebInfo configuration before this was added.
+	add_compile_options($<$<CONFIG:Debug,RelWithDebInfo>:-UNDEBUG>)
+
+	# Simulation core, shared by every test target below.
+	set(VOXEL_SIM_SOURCES
+		src/simulation/octree.cpp
+		src/simulation/provenance.cpp
+		src/simulation/region.cpp
+		src/simulation/lod.cpp
+		src/simulation/lod_rings.cpp
+		src/simulation/brick_pool.cpp
+		src/simulation/svo.cpp
+	)
+
 	add_executable(VoxelSvoTests
 		tests/svo_test.cpp
-		src/simulation/svo.cpp
+		${VOXEL_SIM_SOURCES}
 	)
 	target_include_directories(VoxelSvoTests PRIVATE
 		"${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -259,16 +286,47 @@ if(VOXEL_BUILD_TESTS)
 	target_link_libraries(VoxelSvoTests PRIVATE glm::glm)
 	add_test(NAME VoxelSvoTests COMMAND VoxelSvoTests)
 
+	add_executable(VoxelPersistTests
+		tests/persist_test.cpp
+		${VOXEL_SIM_SOURCES}
+	)
+	target_include_directories(VoxelPersistTests PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/src"
+	)
+	target_link_libraries(VoxelPersistTests PRIVATE glm::glm)
+	add_test(NAME VoxelPersistTests COMMAND VoxelPersistTests)
+
+	add_executable(VoxelLodTests
+		tests/lod_test.cpp
+		${VOXEL_SIM_SOURCES}
+	)
+	target_include_directories(VoxelLodTests PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/src"
+	)
+	target_link_libraries(VoxelLodTests PRIVATE glm::glm)
+	add_test(NAME VoxelLodTests COMMAND VoxelLodTests)
+
 	add_executable(VoxelProtocolTests
 		tests/protocol_test.cpp
 		src/network/protocol.cpp
-		src/simulation/svo.cpp
+		${VOXEL_SIM_SOURCES}
 	)
 	target_include_directories(VoxelProtocolTests PRIVATE
 		"${CMAKE_CURRENT_SOURCE_DIR}/src"
 	)
 	target_link_libraries(VoxelProtocolTests PRIVATE glm::glm)
 	add_test(NAME VoxelProtocolTests COMMAND VoxelProtocolTests)
+
+	add_executable(VoxelAuthorityTests
+		tests/authority_test.cpp
+		src/simulation/authority.cpp
+		${VOXEL_SIM_SOURCES}
+	)
+	target_include_directories(VoxelAuthorityTests PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/src"
+	)
+	target_link_libraries(VoxelAuthorityTests PRIVATE glm::glm)
+	add_test(NAME VoxelAuthorityTests COMMAND VoxelAuthorityTests)
 
 	add_executable(VoxelLifecycleTests
 		tests/lifecycle_test.cpp
@@ -278,11 +336,124 @@ if(VOXEL_BUILD_TESTS)
 		src/network/tcp_socket.cpp
 		src/network/udp_socket.cpp
 		src/simulation/authority.cpp
-		src/simulation/svo.cpp
+		${VOXEL_SIM_SOURCES}
 	)
 	target_include_directories(VoxelLifecycleTests PRIVATE
 		"${CMAKE_CURRENT_SOURCE_DIR}/src"
 	)
 	target_link_libraries(VoxelLifecycleTests PRIVATE glm::glm)
 	add_test(NAME VoxelLifecycleTests COMMAND VoxelLifecycleTests)
+
+	# Pins the streaming delivery contract: no acknowledgement before upload, no
+	# silent drop when the queue is full, retry on silence, and redelivery after
+	# a brick leaves and re-enters the interest window.
+	add_executable(VoxelStreamTests
+		tests/stream_test.cpp
+		src/network/client.cpp
+		src/network/server.cpp
+		src/network/protocol.cpp
+		src/network/tcp_socket.cpp
+		src/network/udp_socket.cpp
+		src/simulation/authority.cpp
+		${VOXEL_SIM_SOURCES}
+	)
+	target_include_directories(VoxelStreamTests PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/src"
+	)
+	target_link_libraries(VoxelStreamTests PRIVATE glm::glm)
+	add_test(NAME VoxelStreamTests COMMAND VoxelStreamTests)
+
+	# Pins the ring-to-level mapping and measures what the server actually
+	# puts on the wire. Without the rings, every brick arrives at full
+	# resolution and the bandwidth saving does not exist.
+	add_executable(VoxelLodRingTests
+		tests/lod_rings_test.cpp
+		src/network/client.cpp
+		src/network/server.cpp
+		src/network/protocol.cpp
+		src/network/tcp_socket.cpp
+		src/network/udp_socket.cpp
+		src/simulation/authority.cpp
+		${VOXEL_SIM_SOURCES}
+	)
+	target_include_directories(VoxelLodRingTests PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/src"
+	)
+	target_link_libraries(VoxelLodRingTests PRIVATE glm::glm)
+	add_test(NAME VoxelLodRingTests COMMAND VoxelLodRingTests)
+
+	# Does W travel where the camera points? Regression test for the change
+	# from move -- raw WASD, yaw-relative -- to moveDirection, resolved by the
+	# client. Measured end to end because the property under test is that the
+	# wire direction and the drawn direction agree.
+	add_executable(VoxelDirectionTests
+		tests/direction_test.cpp
+		src/network/client.cpp
+		src/network/server.cpp
+		src/network/protocol.cpp
+		src/network/tcp_socket.cpp
+		src/network/udp_socket.cpp
+		src/simulation/authority.cpp
+		${VOXEL_SIM_SOURCES}
+	)
+	target_include_directories(VoxelDirectionTests PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/src"
+	)
+	target_link_libraries(VoxelDirectionTests PRIVATE glm::glm)
+	add_test(NAME VoxelDirectionTests COMMAND VoxelDirectionTests)
+
+	# Pins the bounded arena: that a run is trimmed when its brick's level
+	# drops, that a full arena evicts the least recently wanted brick, and that
+	# recency is updated on re-claim. Without the trim the arena fills with
+	# held-but-unused runs and storage is unbounded in practice, however large
+	# the budget is.
+	add_executable(VoxelBrickPoolTests
+		tests/brick_pool_test.cpp
+		src/simulation/brick_pool.cpp
+	)
+	target_include_directories(VoxelBrickPoolTests PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/src"
+	)
+	target_link_libraries(VoxelBrickPoolTests PRIVATE glm::glm)
+	add_test(NAME VoxelBrickPoolTests COMMAND VoxelBrickPoolTests)
+
+	# Pins eviction recovery end to end: an evicted brick must leave the
+	# client's resident set and must be retracted at the server, or its next
+	# resend is dismissed as a duplicate and the terrain never comes back. The
+	# arena is deliberately far smaller than the window so eviction is the
+	# steady state rather than an edge case.
+	add_executable(VoxelLruTests
+		tests/lru_test.cpp
+		src/network/client.cpp
+		src/network/server.cpp
+		src/network/protocol.cpp
+		src/network/tcp_socket.cpp
+		src/network/udp_socket.cpp
+		src/simulation/authority.cpp
+		${VOXEL_SIM_SOURCES}
+	)
+	target_include_directories(VoxelLruTests PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/src"
+	)
+	target_link_libraries(VoxelLruTests PRIVATE glm::glm)
+	add_test(NAME VoxelLruTests COMMAND VoxelLruTests)
+
+	# Pins that the server streams the *whole world*, not just the neighbourhood,
+	# and streams it over time rather than as one burst on connect. Without this
+	# an arena larger than the interest window has nothing to hold.
+	add_executable(VoxelStreamAllTests
+		tests/stream_all_test.cpp
+		src/network/client.cpp
+		src/network/server.cpp
+		src/network/protocol.cpp
+		src/network/tcp_socket.cpp
+		src/network/udp_socket.cpp
+		src/simulation/authority.cpp
+		${VOXEL_SIM_SOURCES}
+	)
+	target_include_directories(VoxelStreamAllTests PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/src"
+	)
+	target_link_libraries(VoxelStreamAllTests PRIVATE glm::glm)
+	add_test(NAME VoxelStreamAllTests COMMAND VoxelStreamAllTests)
 endif()

@@ -9,6 +9,8 @@ namespace {
 constexpr float kGravity = 24.0f;
 constexpr float kJumpSpeed = 8.6f;
 constexpr float kMoveSpeed = 5.6f;
+constexpr float kFlySpeed = 16.0f;   // flight is roughly three times walking
+constexpr float kTerminalSpeed = 60.0f;
 constexpr float kPlayerRadius = 0.3f;
 constexpr float kPlayerHeight = 1.8f;
 constexpr float kEyeHeight = 1.6f;
@@ -53,13 +55,25 @@ void Authority::movePlayer(float seconds) {
     PlayerState& player = m_state.localPlayer;
     const glm::vec3 start = player.position;
 
-    const float yawRadians = player.yaw;
-    const glm::vec2 forward{std::cos(yawRadians), std::sin(yawRadians)};
-    const glm::vec2 right{-forward.y, forward.x};
-    const glm::vec2 wish =
-        (forward * m_wishMove.y + right * m_wishMove.x) * kMoveSpeed;
-    player.velocity.x = wish.x;
-    player.velocity.y = wish.y;
+    // No camera basis is built here any more. The client resolves its own keys
+    // against the same basis the renderer draws with and sends the resulting
+    // world direction, so there is nothing left to reconstruct from `yaw` and
+    // therefore nothing that can disagree with what the player sees.
+    //
+    // `yaw` is still replicated -- other clients draw this player's facing --
+    // it is simply no longer the thing movement is derived from.
+    //
+    // The direction is normalised before use so that a diagonal covers the same
+    // distance per tick as an axis: the client may legitimately send a vector
+    // longer than 1 for a diagonal combination, and without this, W+D would be
+    // a sqrt(2) times faster than W.
+    glm::vec2 wish = m_wishMove;
+    const float wishLength = glm::length(wish);
+    if (wishLength > 1.0f) wish /= wishLength;
+
+    const float speed = player.flying ? kFlySpeed : kMoveSpeed;
+    player.velocity.x = wish.x * speed;
+    player.velocity.y = wish.y * speed;
 
     glm::vec3 target = start + player.velocity * seconds;
     target.x = std::clamp(target.x, kPlayerRadius,
@@ -96,7 +110,8 @@ void Authority::movePlayer(float seconds) {
     for (int y = fy - r; !grounded && y <= fy + r; ++y)
         for (int x = fx - r; x <= fx + r; ++x)
             if (m_world.isSolid(x, y, fz - 1)) { grounded = true; break; }
-    player.grounded = grounded;
+    // Flight is not standing, even when hovering just above the floor.
+    player.grounded = player.flying ? false : grounded;
     (void)kEyeHeight;
 }
 
@@ -110,13 +125,37 @@ void Authority::step(const InputIntent& intent) {
     while (player.yaw < -180.0f) player.yaw += 360.0f;
     player.pitch = std::clamp(player.pitch + intent.look.y, -89.0f, 89.0f);
 
-    m_wishMove = glm::clamp(intent.move, glm::vec2(-1.0f), glm::vec2(1.0f));
+    m_wishMove = glm::clamp(intent.moveDirection, glm::vec2(-1.0f),
+                          glm::vec2(1.0f));
 
-    if (intent.jumpPressed && player.grounded) {        player.velocity.z = kJumpSpeed;
-        player.grounded = false;
+    // A zero client tick marks an intent the server replayed because no fresh
+    // one arrived this tick. Held flight keys keep their last known value so a
+    // dropped packet cannot make a held key stutter, and a released key is
+    // picked up on the very next fresh intent. The requested mode is latched
+    // for the same reason: it is a desired state, not an event.
+    if (intent.clientTick != 0) {
+        m_ascendHeld = intent.jumpPressed;
+        m_descendHeld = intent.descendPressed;
+        m_flyingRequested = intent.flying;
     }
-    player.velocity.z -= kGravity * kTickSeconds;
-    player.velocity.z = std::max(player.velocity.z, -60.0f);
+    player.flying = m_flyingRequested;
+
+    // Nothing about flight is simulated on the client: this is the only place
+    // gravity is switched off, and it happens here, next to the collision it
+    // still respects.
+    if (player.flying) {
+        float vertical = 0.0f;
+        if (m_ascendHeld) vertical += 1.0f;
+        if (m_descendHeld) vertical -= 1.0f;
+        player.velocity.z = vertical * kFlySpeed;
+    } else {
+        if (intent.jumpPressed && player.grounded) {
+            player.velocity.z = kJumpSpeed;
+            player.grounded = false;
+        }
+        player.velocity.z -= kGravity * kTickSeconds;
+        player.velocity.z = std::max(player.velocity.z, -kTerminalSpeed);
+    }
 
     movePlayer(kTickSeconds);
 

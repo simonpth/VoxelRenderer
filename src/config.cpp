@@ -1,19 +1,23 @@
 #include "config.hpp"
 
 #include <cstdlib>
+#include <limits>
 
 namespace voxel {
 namespace {
 
 // Reads the next argv token as an unsigned decimal. Returns false when the
 // token is missing or not a number, leaving `target` untouched.
-bool readUnsigned(int& index, int argc, char** argv, std::uint32_t& target) {
+template <typename T>
+bool readUnsigned(int& index, int argc, char** argv, T& target) {
     if (index + 1 >= argc) return false;
     try {
-        const auto value = std::stoul(argv[index + 1]);
-        if (value > 0xFFFFFFFFu) return false;
+        const auto value = std::stoull(argv[index + 1]);
+        if (value > static_cast<unsigned long long>(
+                        std::numeric_limits<T>::max()))
+            return false;
         ++index;
-        target = static_cast<std::uint32_t>(value);
+        target = static_cast<T>(value);
         return true;
     } catch (const std::exception&) {
         return false;
@@ -37,7 +41,9 @@ const char* Config::usage() {
            "  --brick  <n>      power-of-two edge of one octree brick (default 128)\n"
            "  --seed   <n>      terrain seed\n"
            "  --radius <n>      brick streaming radius (default 6)\n"
-           "  --pool   <n>      GPU node pool capacity in nodes (default 4M)\n"
+           "  --pool   <n>      client GPU world budget in SVO nodes (default 3 GiB)\n"
+           "  --bw     <n>      server world-stream bandwidth in bytes/sec (default 32M)\n"
+           "  --server-mem <n>  server RAM budget for the world in bytes (default 8G)\n"
            "  --ray    <n>      maximum primary ray distance in cells\n";
 }
 
@@ -85,6 +91,12 @@ Config parseConfig(int argc, char** argv) {
         } else if (argument == "--pool") {
             if (!readUnsigned(i, argc, argv, config.poolNodes))
                 return fail(config, "pool");
+        } else if (argument == "--bw") {
+            if (!readUnsigned(i, argc, argv, config.streamBytesPerSecond))
+                return fail(config, "bw");
+        } else if (argument == "--server-mem") {
+            if (!readUnsigned(i, argc, argv, config.serverWorldBytes))
+                return fail(config, "server-mem");
         } else if (argument == "--ray") {
             if (!readUnsigned(i, argc, argv, config.maxRayDistance))
                 return fail(config, "ray");

@@ -83,7 +83,7 @@ void destroyMappedBuffer(VmaAllocator allocator, MappedBuffer &buffer) {
 } // namespace voxel
 
 VulkanContext::VulkanContext(Window *window, std::uint32_t poolNodes)
-    : m_window(window) {
+    : m_window(window), m_pool(std::max<std::uint32_t>(poolNodes, 4096u)) {
   if (!m_window)
     throw std::invalid_argument("VulkanContext requires a Window");
   if (volkInitialize() != VK_SUCCESS)
@@ -247,11 +247,14 @@ void VulkanContext::createWorldBuffers(std::uint32_t poolNodes) {
   std::memset(m_nodePool.mapped, 0, m_nodePool.size);
   std::memset(m_materials.mapped, 0, m_materials.size);
 
-  m_freeRanges.clear();
-  m_resident.clear();
-  m_freeRanges[0] = poolNodes;
+  // The arena starts empty and at the budget it was given. Growing later is a
+  // rare, deliberate act for a single brick bigger than the whole arena; it is
+  // not how the arena normally adapts.
+  m_pool = voxel::BrickPool(poolNodes);
   m_poolUsed = 0;
   m_residentBricks = 0;
+  m_evictedBricks = 0;
+  m_warnedPoolFull = false;
 
   std::cout << "SVO GPU arena: " << poolNodes << " nodes, "
             << (static_cast<std::uint64_t>(poolNodes) * sizeof(voxel::SvoNode))
@@ -265,44 +268,35 @@ void VulkanContext::destroyWorldBuffers() {
   m_rootTableCapacity = 0;
   m_nodePoolCapacity = 0;
   m_materialCapacity = 0;
-  m_freeRanges.clear();
-  m_resident.clear();
+  m_pool.clear();
+  m_poolUsed = 0;
+  m_residentBricks = 0;
 }
 
-std::uint32_t VulkanContext::allocateNodes(std::uint32_t count) {
-  if (count == 0 || count > m_nodePoolCapacity) return 0xFFFFFFFFu;
-  // First fit. Small worlds hold every brick, so the free list stays tiny and
-  // this is effectively a constant-time pop.
-  for (auto it = m_freeRanges.begin(); it != m_freeRanges.end(); ++it) {
-    if (it->second < count) continue;
-    const std::uint32_t offset = it->first;
-    const std::uint32_t remainder = it->second - count;
-    m_freeRanges.erase(it);
-    if (remainder > 0) m_freeRanges.emplace(offset + count, remainder);
-    return offset;
-  }
-  return 0xFFFFFFFFu;
-}
-
-void VulkanContext::releaseNodes(std::uint32_t offset, std::uint32_t count) {
-  if (count == 0) return;
-  // Insert the range and coalesce with neighbours, so the pool never
-  // fragments into unusable slivers.
-  auto it = m_freeRanges.lower_bound(offset);
-  if (it != m_freeRanges.begin()) {
-    const auto previous = std::prev(it);
-    if (previous->first + previous->second == offset) {
-      offset = previous->first;
-      count += previous->second;
-      m_freeRanges.erase(previous);
-    }
-  }
-  it = m_freeRanges.lower_bound(offset);
-  if (it != m_freeRanges.end() && offset + count == it->first) {
-    count += it->second;
-    m_freeRanges.erase(it);
-  }
-  m_freeRanges.emplace(offset, count);
+// Reallocates the node arena to `newCapacity` nodes, keeping every byte where
+// it was. Offsets are stable across a grow -- the arena only ever extends at
+// its end -- so no resident brick moves and no pool-absolute link inside any
+// payload has to be rewritten. This is why growing is safe but deliberately
+// rare: the copy is the whole arena, so "the window does not fit the budget" is
+// eviction's job and this path is only for a single brick that cannot fit at all.
+void VulkanContext::resizeNodePool(std::uint32_t newCapacity) {
+  const std::size_t current =
+      static_cast<std::size_t>(m_nodePool.size) / sizeof(voxel::SvoNode);
+  if (newCapacity <= current) return;
+  voxel::MappedBuffer replacement{};
+  voxel::createMappedBuffer(
+      m_allocator,
+      static_cast<VkDeviceSize>(newCapacity) * sizeof(voxel::SvoNode),
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, replacement);
+  std::memcpy(replacement.mapped, m_nodePool.mapped, m_nodePool.size);
+  voxel::destroyMappedBuffer(m_allocator, m_nodePool);
+  m_nodePool = replacement;
+  m_nodePoolCapacity = newCapacity;
+  writeWorldDescriptors();
+  std::cout << "SVO GPU arena grown to " << newCapacity << " nodes ("
+            << (static_cast<std::uint64_t>(newCapacity) *
+                sizeof(voxel::SvoNode))
+            << " bytes)\n";
 }
 
 void VulkanContext::createSwapchain() {
@@ -719,67 +713,125 @@ void VulkanContext::uploadWorld(voxel::RenderState &state) {
   auto *rootTable = static_cast<uint32_t *>(m_rootTable.mapped);
   auto *nodePool = static_cast<uint32_t *>(m_nodePool.mapped);
 
+  // Tell the arena what the player can currently see, so that making room for a
+  // brick from across the world never costs the bricks under their feet.
+  // Without this the arena evicts purely by recency, and a progressive fill
+  // walking outward steadily replaces the visible window with scenery.
+  if (state.interestRadius > 0 && state.brick > 0 && state.rootDimX > 0 &&
+      state.rootDimY > 0) {
+    const std::int32_t brick = static_cast<std::int32_t>(state.brick);
+    const std::int32_t dimX = static_cast<std::int32_t>(state.rootDimX);
+    const std::int32_t dimY = static_cast<std::int32_t>(state.rootDimY);
+    m_pool.setWindow(
+        std::clamp(state.interestX / brick, 0, dimX - 1),
+        std::clamp(state.interestY / brick, 0, dimY - 1),
+        std::clamp(state.interestZ / brick,
+                   0, static_cast<std::int32_t>(state.rootDimZ) - 1),
+        state.interestRadius, state.rootDimX, state.rootDimY, state.brick);
+  } else {
+    m_pool.clearWindow();
+  }
+
   std::size_t rootFirst = m_rootTableCapacity;
   std::size_t rootLast = 0;
   std::size_t poolFirst = m_nodePoolCapacity;
   std::size_t poolLast = 0;
 
-  for (const voxel::BrickUpdate &update : state.bricks) {
+  state.uploadedRoots.clear();
+  state.processedRoots.clear();
+  state.evictedRoots.clear();
+  for (voxel::BrickUpdate &update : state.bricks) {
+    // Every brick handed over is reported as processed, whatever the outcome.
+    // That is what lets the client tell "still queued" from "handed over and
+    // dropped": a refused brick must leave the client's outstanding set, or its
+    // next resend is dismissed as a duplicate and it wedges -- the client
+    // waiting for an upload that will never come, the server waiting for an
+    // ack that will never be sent.
+    //
+    // `uploaded` is cleared first, so every path below that bails out leaves
+    // the brick unacknowledged and therefore eligible for a retry.
+    update.uploaded = false;
+    state.processedRoots.push_back(update.rootIndex);
     if (update.rootIndex >= m_rootTableCapacity) continue;
 
     if (update.remove) {
-      const auto found = m_resident.find(update.rootIndex);
-      if (found == m_resident.end()) continue;
-      releaseNodes(found->second.offset, found->second.count);
-      m_poolUsed -= found->second.count;
-      --m_residentBricks;
-      m_resident.erase(found);
-      const std::size_t header = static_cast<std::size_t>(update.rootIndex) * 2;
-      rootTable[header + 0] = 0;
-      rootTable[header + 1] = 0;
-      rootFirst = std::min(rootFirst, header);
-      rootLast = std::max(rootLast, header + 1);
+      voxel::BrickPool::Slot slot{};
+      if (m_pool.drop(update.rootIndex, slot)) {
+        m_residentBricks = static_cast<std::uint32_t>(m_pool.size());
+        m_poolUsed = m_pool.used();
+        const std::size_t header =
+            static_cast<std::size_t>(update.rootIndex) * 2;
+        rootTable[header + 0] = 0;
+        rootTable[header + 1] = 0;
+        rootFirst = std::min(rootFirst, header);
+        rootLast = std::max(rootLast, header + 1);
+      }
       continue;
     }
     if (update.nodes.empty()) continue;
     const std::uint32_t needed =
         static_cast<std::uint32_t>(update.nodes.size());
-    const auto found = m_resident.find(update.rootIndex);
-    std::uint32_t offset = 0xFFFFFFFFu;
-    if (found != m_resident.end()) {
-      if (found->second.count >= needed) {
-        offset = found->second.offset;   // rewrite in place, keep the slack
-      } else {
-        releaseNodes(found->second.offset, found->second.count);
-        m_poolUsed -= found->second.count;
-        m_resident.erase(found);
-      }
+
+    // One brick bigger than the whole arena is a sizing problem, not an
+    // eviction problem: nothing can be dropped to make it fit. Grow instead,
+    // which keeps every offset valid -- see resizeNodePool. The arena's normal
+    // answer to a full window is eviction, so this is deliberately the rare
+    // path; if it fires at all the pool was sized below a single brick.
+    if (needed > m_pool.capacity()) {
+      std::uint32_t target = m_pool.capacity();
+      while (target < needed && target != 0) target <<= 1;
+      m_pool.grow(target == 0 ? needed : target);
     }
-    if (offset == 0xFFFFFFFFu) {
-      offset = allocateNodes(needed);
-      if (offset == 0xFFFFFFFFu) {
-        // Pool exhausted. The client decides what to evict; this brick is
-        // simply skipped, and a diagnostic is printed once per run so a
-        // persistent shortfall is visible without spamming every frame.
-        static bool warned = false;
-        if (!warned) {
-          std::cerr << "Vulkan: SVO node pool exhausted (" << m_nodePoolCapacity
-                    << " nodes); dropping a brick that needs " << needed
-                    << " nodes\n";
-          warned = true;
-        }
-        continue;
+    if (m_pool.capacity() > m_nodePoolCapacity)
+      resizeNodePool(m_pool.capacity());
+
+    const voxel::BrickPool::Claim claim = m_pool.claim(update.rootIndex, needed);
+    if (!claim.placed) {
+      // Whatever was evicted before giving up is reported, not kept as a
+      // surprise: the client has to stop considering those resident. The
+      // brick itself stays unacknowledged, so the server brings it back on
+      // its next pass and the claim is tried again from a different arena
+      // state.
+      for (const std::uint32_t evicted : claim.evicted) {
+        const std::size_t header = static_cast<std::size_t>(evicted) * 2;
+        rootTable[header + 0] = 0;
+        rootTable[header + 1] = 0;
+        rootFirst = std::min(rootFirst, header);
+        rootLast = std::max(rootLast, header + 1);
+        state.evictedRoots.push_back(evicted);
       }
-      m_poolUsed += needed;
-      ++m_residentBricks;
-    } else if (found != m_resident.end()) {
-      m_poolUsed += needed - found->second.count;
+      m_evictedBricks += claim.evicted.size();
+      if (!m_warnedPoolFull) {
+        std::cerr << "Vulkan: SVO node pool exhausted (" << m_pool.capacity()
+                  << " nodes); a brick needing " << needed
+                  << " nodes could not be placed\n";
+        m_warnedPoolFull = true;
+      }
+      m_residentBricks = static_cast<std::uint32_t>(m_pool.size());
+      m_poolUsed = m_pool.used();
+      continue;
     }
-    m_resident[update.rootIndex] = Occupancy{offset, needed};
+
+    // Whatever had to go to make room is reported here, not left as a
+    // surprise: the client has to stop considering these resident, and the
+    // server has to be told to forget them, or their next resend is dismissed
+    // as a duplicate and the terrain is missing for the rest of the session.
+    for (const std::uint32_t evicted : claim.evicted) {
+      const std::size_t header = static_cast<std::size_t>(evicted) * 2;
+      rootTable[header + 0] = 0;
+      rootTable[header + 1] = 0;
+      rootFirst = std::min(rootFirst, header);
+      rootLast = std::max(rootLast, header + 1);
+      state.evictedRoots.push_back(evicted);
+    }
+    m_evictedBricks += claim.evicted.size();
+    m_residentBricks = static_cast<std::uint32_t>(m_pool.size());
+    m_poolUsed = m_pool.used();
 
     // Relink the payload's brick-relative child indices into the global pool,
     // then copy the whole brick in one memcpy.
-    for (voxel::SvoNode& node : const_cast<std::vector<voxel::SvoNode>&>(update.nodes))
+    const std::uint32_t offset = claim.offset;
+    for (voxel::SvoNode& node : update.nodes)
       if (node.firstChild() != 0)
         node.setFirstChild(node.firstChild() + offset);
 
@@ -798,6 +850,13 @@ void VulkanContext::uploadWorld(voxel::RenderState &state) {
     rootTable[header + 1] = root.word1();
     rootFirst = std::min(rootFirst, header);
     rootLast = std::max(rootLast, header + 1);
+
+    // Only now is the brick genuinely in the pool, and only now may the client
+    // tell the server so. Acknowledging earlier -- on receipt, or before the
+    // pool is known to have room -- is what let bricks end up permanently
+    // undelivered while the server believed them sent.
+    update.uploaded = true;
+    state.uploadedRoots.push_back(update.rootIndex);
   }
 
   if (rootLast >= rootFirst)
@@ -1111,7 +1170,10 @@ void VulkanContext::drawFrame(float deltaTime, float totalTime,
                            state.localPlayer.velocity.y,
                            state.localPlayer.velocity.z),
                std::format("View: {:.2f}, {:.2f}, {:.2f}", viewDirection.x,
-                           viewDirection.y, viewDirection.z)},
+                           viewDirection.y, viewDirection.z),
+               // The authority owns flight, so the HUD reads it from the
+               // snapshot rather than from local input.
+               state.localPlayer.flying},
               m_swapchain.extent.width, m_swapchain.extent.height);
   updateOverlayBuffer(frame, m_ui.getVertices());
 

@@ -168,6 +168,14 @@ float4 unpackRgba8(uint packed) {
 bool walkBricks(float3 origin, float3 dir, float rayLimit, bool anyHit,
                 out float hitDistance, out float3 hitNormal,
                 out uint hitMaterial) {
+    // Cleared up front, because not every early return sets them: a caller
+    // that inspects the outputs after a false result -- raycast does, to tell
+    // "hit air" from "ran out of data" -- would otherwise read uninitialised
+    // memory. A miss with material 0 means the ray genuinely reached nothing.
+    hitDistance = 0.0f;
+    hitNormal = float3(0.0f, 0.0f, 1.0f);
+    hitMaterial = 0u;
+
     const float3 inverseDirection = safeInverse(dir);
     const float3 worldLo = float3(0.0f, 0.0f, 0.0f);
     const float3 worldHi = float3((float)pc.sizeX, (float)pc.sizeY,
@@ -204,7 +212,7 @@ bool walkBricks(float3 origin, float3 dir, float rayLimit, bool anyHit,
         // Unknown data is never silently treated as empty space: the caller
         // renders it as missing rather than as air.
         if (((rootPacked.x >> 24) & kSvoFlagResident) == 0u) {
-            hitMaterial = 0xFFFFu;
+            hitMaterial = kUnknownMaterial;
             return false;
         }
 
@@ -245,12 +253,28 @@ bool walkBricks(float3 origin, float3 dir, float rayLimit, bool anyHit,
 
 // Shadow test. Only "did anything block this" matters, so the first terminal
 // solid node wins and no shading is done.
+//
+// A missing brick counts as *blocking*. walkBricks reports it by returning
+// false with hitMaterial set to kUnknown, which is the same signal raycast
+// reads -- and raycast correctly renders it as missing rather than as air. The
+// shadow path used to return that false straight through, so a shadow ray that
+// merely clipped an unloaded brick reported "unblocked" and the surface lit up
+// as though the sun were behind the camera. The visible result was shadows
+// pointing away from the light, or missing altogether wherever streaming was
+// still in progress.
+//
+// Treating unknown as blocked is the conservative direction and the one
+// consistent with the rest of the shader: you cannot see that a shadow is
+// slightly too dark, but you very much can see a false highlight.
 bool occluded(float3 origin, float3 dir) {
     float hitDistance;
     float3 hitNormal;
     uint hitMaterial;
-    return walkBricks(origin, dir, (float)pc.maxRayDistance, true, hitDistance,
-                      hitNormal, hitMaterial);
+    const bool hit = walkBricks(origin, dir, (float)pc.maxRayDistance, true,
+                                hitDistance, hitNormal, hitMaterial);
+    // `hitMaterial` is kUnknownMaterial exactly when the walk stopped because a
+    // brick had not been streamed. Both cases block.
+    return hit || hitMaterial == kUnknownMaterial;
 }
 
 // Primary ray: the nearest terminal solid node, shaded by the material table.
@@ -261,11 +285,11 @@ bool raycast(float3 origin, float3 dir, float rayLimit, out float3 color,
     uint hitMaterial = 0;
     if (!walkBricks(origin, dir, rayLimit, false, hitDistance, hitNormal,
                     hitMaterial)) {
-        if (hitMaterial != 0xFFFFu) return false;
+        if (hitMaterial != kUnknownMaterial) return false;
         // Missing brick: show it as unknown data, not as empty space.
         color = kUnknownColor;
         normal = float3(0.0f, 0.0f, 1.0f);
-        material = 0xFFFFu;
+        material = kUnknownMaterial;
         return true;
     }
 

@@ -1,12 +1,20 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <vector>
 
+#include "octree.hpp"
+#include "provenance.hpp"
 #include "svo_node.hpp"
 #include "state.hpp"
 
 namespace voxel {
+
+// Defined in region.hpp, which needs WorldSpec from here. Forward declaring it
+// keeps the include graph acyclic: World only ever holds a pointer.
+class RegionStore;
 
 // ---------------------------------------------------------------------------
 // World geometry
@@ -44,62 +52,40 @@ std::uint32_t terrainTop(std::int32_t x, std::int32_t y, std::int32_t maxZ);
 std::uint16_t terrainMaterial(std::int32_t x, std::int32_t y, std::int32_t z,
                              std::uint32_t top);
 
+// Bumped whenever a change here would make the same seed produce a different
+// world. Saved regions record it and a mismatch is refused rather than silently
+// replayed: an old delta means "this voxel differed from *the old generator*",
+// which the new one cannot interpret.
+std::uint32_t generatorVersion();
+
 // The material table the server ships to clients.
 const std::vector<Material>& serverMaterials();
 
 // ---------------------------------------------------------------------------
 // Brick: one octree covering `brick^3` cells, addressed in brick-local cells.
 //
-// All nodes live in one flat vector. A node with children owns a contiguous
-// run of eight child slots, which keeps GPU traversal down to one indexed load
-// and keeps the CPU allocator down to a free list of eight-node blocks. A
-// reused block is zeroed on allocation, so a child's default state is "empty".
-//
-// Node index 0 is always the brick root, which is what lets `firstChild == 0`
-// mean "no children" without spending a flag.
+// The node storage and allocator live in Octree; a Brick adds the cell API and
+// the revision that the streaming path compares.
 // ---------------------------------------------------------------------------
 
-class Brick {
+class Brick : public Octree {
   public:
-    explicit Brick(std::uint32_t lodLevel);
+    explicit Brick(std::uint32_t lodLevel) : Octree(lodLevel) {}
 
-    // Node primitives: the world generator drives the tree with these so a
-    // single set never costs a full root-to-leaf descent.
-    const SvoNode& node(std::uint32_t index) const { return m_nodes[index]; }
-    SvoNode& node(std::uint32_t index) { return m_nodes[index]; }
-    std::uint32_t split(std::uint32_t nodeIndex);
-    void writeLeaf(std::uint32_t nodeIndex, std::uint16_t material);
-    void collapseReachable();
-
-    // Cell API for edits and lookups.
+    // Cell API for edits and lookups. `fill` is inherited from Octree.
     std::uint16_t get(std::uint32_t x, std::uint32_t y, std::uint32_t z) const;
     void set(std::uint32_t x, std::uint32_t y, std::uint32_t z,
              std::uint16_t material);
-    void fill(std::uint32_t minX, std::uint32_t minY, std::uint32_t minZ,
-              std::uint32_t maxX, std::uint32_t maxY, std::uint32_t maxZ,
-              std::uint16_t material);
 
-    std::uint32_t lodLevel() const { return m_nodes[0].lodLevel; }
     std::uint32_t revision() const { return m_revision; }
     void setRevision(std::uint32_t revision) { m_revision = revision; }
     bool empty() const {
-        return !m_nodes[0].hasChildren() && !m_nodes[0].solid();
+        return !node(0).hasChildren() && !node(0).solid();
     }
     bool generated() const { return m_generated; }
     void markGenerated() { m_generated = true; }
 
-    // Rewrites the reachable subtree into GPU-ready form: `rootNode` is the
-    // brick root (it goes into the root table) and `nodes` is a contiguous,
-    // breadth-first array where a node's children start at `firstChild`.
-    void compact(std::vector<SvoNode>& nodes, SvoNode& rootNode) const;
-
   private:
-    std::uint32_t allocateBlock(std::uint32_t parent);
-    void releaseSubtree(std::uint32_t firstChild);
-    void collapse(std::uint32_t nodeIndex);
-
-    std::vector<SvoNode> m_nodes;   // index 0 is the brick root
-    std::vector<std::uint32_t> m_freeBlocks;
     std::uint32_t m_revision = 0;
     bool m_generated = false;
 };
@@ -115,10 +101,15 @@ class Brick {
 class World {
   public:
     World(WorldSpec spec, std::uint64_t seed);
+    // `store` is optional: without it the world is ephemeral and edits live
+    // only in the resident bricks (the previous behaviour). With it, every
+    // edit is also written to the persistent provenance tree.
+    World(WorldSpec spec, std::uint64_t seed, RegionStore* store);
 
     const WorldSpec& spec() const { return m_spec; }
     std::uint64_t seed() const { return m_seed; }
     std::uint32_t revision() const { return m_revision; }
+    RegionStore* store() { return m_store; }
 
     std::uint32_t rootDimX() const { return m_spec.rootDimX(); }
     std::uint32_t rootDimY() const { return m_spec.rootDimY(); }
@@ -146,6 +137,18 @@ class World {
     void snapshot(std::uint32_t rootIndex, std::uint32_t& revision,
                   SvoNode& rootNode, std::vector<SvoNode>& nodes);
 
+    // Streaming snapshot at reduced detail: the same brick, rebuilt from the
+    // full-resolution tree with every leaf no finer than `leafLevel` (level k
+    // means leaves of 2^k cells on a side).
+    //
+    // The reduction is derived from the full tree rather than produced by a
+    // shallower generation walk, so there is exactly one implementation of the
+    // terrain rules and no way for the two to disagree about what the world
+    // looks like.
+    void snapshotLod(std::uint32_t rootIndex, std::uint8_t leafLevel,
+                     std::uint32_t& revision, SvoNode& rootNode,
+                     std::vector<SvoNode>& nodes);
+
     // Current revision of one brick, generating it if necessary. Used by the
     // world stream to skip bricks the client already holds.
     std::uint32_t brickRevision(std::uint32_t rootIndex);
@@ -154,10 +157,31 @@ class World {
 
   private:
     void generate(std::uint32_t rootIndex);
+    // Fills `brick` from the generator alone, at full resolution. Never
+    // touches the provenance store.
+    //
+    // There is deliberately no depth parameter: the generator always produces
+    // the real thing, and coarser levels are derived from that result rather
+    // than generated by a second walk. One generator means one place for a
+    // terrain rule to live, and it cannot drift out of step with itself.
+    void buildProcedural(std::uint32_t rootIndex, Brick& brick) const;
     Brick& ensure(std::uint32_t rootIndex);
+    // What the generator alone puts in a brick-local cell, with no edits
+    // applied. Regenerates a scratch brick because the generator's box
+    // uniformity rules are not reducible to a per-cell function.
+    std::uint16_t proceduralValue(std::uint32_t rootIndex, std::uint32_t bx,
+                                  std::uint32_t by, std::uint32_t bz) const;
+    // Applies a cell edit to the persistent provenance tree, pruning the
+    // override when the new material lands on the generator's value.
+    // `previous` is what the cell held before the write, which *is* the
+    // generator's value for any cell that has never been edited.
+    void recordEdit(std::uint32_t rootIndex, std::uint32_t bx, std::uint32_t by,
+                    std::uint32_t bz, std::uint16_t material,
+                    std::uint16_t previous);
 
     WorldSpec m_spec;
     std::uint64_t m_seed;
+    RegionStore* m_store = nullptr;
     std::vector<Brick> m_bricks;
     std::uint32_t m_revision = 1;
 };

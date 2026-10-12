@@ -23,9 +23,30 @@ struct Config {
     WorldSpec world{1024, 1024, 256, 128};
     std::uint64_t seed = 0xC0FFEE1234ULL;
     std::uint8_t interestRadius = 6;
-    // GPU node pool capacity, in SVO nodes (8 bytes each).
-    std::uint32_t poolNodes = 4u * 1024u * 1024u;
-    std::uint32_t maxRayDistance = 512;
+
+    // GPU node pool: the client's entire budget for world storage, in SVO
+    // nodes of 8 bytes each. This is the whole allowance -- no geometry, no
+    // textures, no framebuffers -- and eviction keeps the client inside it no
+    // matter how large the world is.
+    //
+    // 3 GiB is 402,653,184 nodes, which is 86x the entire default world at full
+    // resolution. That headroom is the point: the arena can hold the whole
+    // world, so the server can stream all of it and the client never has to
+    // choose between the ground it is standing on and the ground it walked
+    // past.
+    std::uint32_t poolNodes = 402'653'184u;
+
+    // Bytes per second the server may spend streaming world data. The whole
+    // world is streamed, so this is what makes it arrive over time rather than
+    // all at once. Zero means unmetered -- fine on loopback, unwise elsewhere.
+    std::uint64_t streamBytesPerSecond = 32ull * 1024 * 1024;
+
+    // Server RAM budget for the world, in bytes. Reported at startup against the
+    // world's real cost, so an oversized world is visible before the allocator
+    // finds out.
+    std::uint64_t serverWorldBytes = 8ull * 1024 * 1024 * 1024;
+
+    std::uint32_t maxRayDistance = 2048;
     // Set when a negotiation flag is malformed; reported at startup.
     bool helpRequested = false;
     bool parseError = false;

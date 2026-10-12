@@ -57,9 +57,9 @@ Everything that decides *where a player is* happens on the server:
   snapshots.
 - The client interpolates between the two newest snapshots purely for display.
 
-Mouse look is the one exception the user asked for: it is applied locally so
-the camera responds within a frame. The authoritative orientation still comes
-from the server for other players.
+Mouse look is the one deliberate exception: it is applied locally so the
+camera responds within a frame. The authoritative orientation still comes from
+the server and is what other players see.
 
 Collision is exact against the octree. The server never generates a whole
 dense volume: it regenerates the one brick a query misses.
@@ -129,10 +129,10 @@ instead of a fixed eight. On the default world that is the difference between
   costs one small struct per brick even when empty, which is the right
   trade-off for direct indexing; a sparse map would be the upgrade path for
   very large worlds.
-- Generation is bottom-up with a min/max **height mipmap** over the brick
-  footprint, so the "is this box uniform" test is O(1) instead of a per-cell
-  scan. The result is near-minimal: the full 1024 x 1024 x 256 world is about
-  2.9M nodes (23 MiB) in ~150 ms.
+- Generation splits top-down and uses a min/max **height mipmap** over the
+  brick footprint, so its "is this box uniform" test is O(1) instead of a
+  per-cell scan. The full 1024 x 1024 x 256 world generates in about 105 ms and
+  compacts in about 11 ms, for 2.9M nodes (22 MiB, 178 KB per brick).
 
 The merge step only collapses a node whose eight children are *identical
 leaves*. Two subtrees that merely look identical in their summary fields are
@@ -214,11 +214,15 @@ LOD is deliberately out of scope for now; the traversal is exact. The node's
 | TCP     | C -> S     | `WorldInterest`, `WorldAck` |
 | TCP     | S -> C     | `WorldDescriptor`, `BrickSnapshot` |
 
-One persistent TCP connection per client, full duplex, polled on both sides.
-A handshake (`WorldInterest`) establishes the stream; the server then replies
-with the world descriptor and one brick snapshot per frame, nearest first, in
-bounded batches. The client acknowledges each brick so the server stops
-resending it and skips revisions it already holds.
+One TCP connection per client, full duplex, polled on both sides, each served
+by its own thread. A handshake (`WorldInterest`) establishes the stream; the
+server then replies with the world descriptor and one brick snapshot per
+frame, nearest first, in bounded batches. The client acknowledges each brick so
+the server stops resending it and skips revisions it already holds.
+
+The listener reaps only stream threads whose connection has already finished.
+Joining a *live* one there would make a second client wait for the first to
+disconnect; `VoxelLifecycleTests` covers that case with two concurrent clients.
 
 `BrickSnapshot` carries one contiguous node array where index 0 is the brick
 root. Decoding validates the frame length, every child index against the
@@ -236,13 +240,34 @@ VoxelSvoTests        brick ops, root-layer indexing, snapshot round-trip
                      material table, generation revision
 VoxelProtocolTests   encode/decode round trips and rejection of malformed
                      and hostile payloads
-VoxelLifecycleTests  real loopback UDP/TCP: connect, stream, then stop and
-                     destroy in both orders. Covers the shutdown path.
+VoxelLifecycleTests  real loopback UDP/TCP: connect, stream, stop and
+                     destroy in both orders, plus two concurrent streams.
+                     Covers the shutdown and thread-reaping paths.
 ```
 
 The snapshot round-trip test walks the compacted array with the same
 addressing rules the shader uses and compares against `World::get` over the
 whole default world, so a CPU-side mismatch fails there instead of on screen.
+
+## Source map
+
+```text
+src/simulation/svo_node.hpp   8-byte packed node, shared CPU/GPU layout
+src/simulation/svo.hpp/.cpp   Brick octree, N-ary root layer, World, terrain
+src/simulation/state.hpp      wire and render types, material table
+src/simulation/authority.*    the only player physics and collision
+src/network/protocol.*        encode/decode and payload validation
+src/network/udp_socket.*      intent and snapshots
+src/network/tcp_socket.*      length-framed world stream
+src/network/server.*          world ownership, tick, per-client streams
+src/network/client.*          intent out, bricks to GPU, interpolation
+src/renderer/vulkancontext.*  arena, uploads, pipelines, compute dispatch
+src/shaders/svo.slang         layout constants and traversal helpers
+src/shaders/compute.slang     primary ray, shadow ray, sky
+src/shaders/fullscreen.slang  compute image blit
+src/shaders/overlay.slang     UI overlay
+src/config.hpp/.cpp           defaults and command-line parsing
+```
 
 ## Conventions
 

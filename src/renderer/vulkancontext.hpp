@@ -36,6 +36,7 @@
 #include "ui.hpp"
 #include "../simulation/svo_node.hpp"
 #include "../simulation/state.hpp"
+#include "../simulation/brick_pool.hpp"
 
 #ifndef VOXEL_SHADER_DIR
 #define VOXEL_SHADER_DIR "shaders/"
@@ -145,15 +146,12 @@ class VulkanContext {
     void writeWorldDescriptors();
     void createWorldBuffers(std::uint32_t poolNodes);
     void destroyWorldBuffers();
+    // Reallocates the node arena to a larger capacity, preserving contents and
+    // every offset. Only for a single brick that cannot fit at all.
+    void resizeNodePool(std::uint32_t newCapacity);
     void uploadWorld(voxel::RenderState& state);
     void updateOverlayBuffer(FrameData& frame,
                              const std::vector<OverlayVertex>& vertices);
-
-    // --- GPU node arena ---
-    // One contiguous run per resident brick, handed out by a coalescing free
-    // list. Nodes are eight bytes, so a brick costs exactly what it needs.
-    std::uint32_t allocateNodes(std::uint32_t count);
-    void releaseNodes(std::uint32_t offset, std::uint32_t count);
 
     // --- runtime ---
     void cleanupSwapchain();
@@ -208,7 +206,9 @@ class VulkanContext {
     voxel::MappedBuffer m_rootTable{};
     std::size_t m_rootTableCapacity = 0;
 
-    // Node pool: every SVO node of every resident brick.
+    // Node pool: every SVO node of every resident brick. The buffer is a flat
+    // arena sized once and never reordered; the pool below decides which brick
+    // is where in it, and what to throw away when it is full.
     voxel::MappedBuffer m_nodePool{};
     std::size_t m_nodePoolCapacity = 0;
 
@@ -216,12 +216,10 @@ class VulkanContext {
     voxel::MappedBuffer m_materials{};
     std::size_t m_materialCapacity = 0;
 
-    std::map<std::uint32_t, std::uint32_t> m_freeRanges;   // offset -> length
-    struct Occupancy {
-        std::uint32_t offset = 0;
-        std::uint32_t count = 0;
-    };
-    std::map<std::uint32_t, Occupancy> m_resident;         // rootIndex -> run
+    // Which brick owns which run of the arena, and in what order they were last
+    // wanted. Keeping this here rather than in the client means the thing that
+    // knows the capacity is also the thing that decides what has to go.
+    voxel::BrickPool m_pool;
 
     // CPU-side mirror of the uploaded material table, so re-uploads are
     // skipped when nothing changed.
@@ -235,6 +233,14 @@ class VulkanContext {
     float m_rollingFps = 60.0f;
     std::uint32_t m_residentBricks = 0;
     std::uint32_t m_poolUsed = 0;
+    // Cumulative total of bricks dropped to make room for something else. A
+    // per-frame count says nothing - one frame can legitimately evict a lot
+    // while the window shifts - but a total that keeps climbing while the
+    // player stands still says the arena is undersized.
+    std::uint64_t m_evictedBricks = 0;
+    // Whether the "arena full" warning has been printed. Once, not once a
+    // frame: a persistent shortfall is visible from this and should not scroll.
+    bool m_warnedPoolFull = false;
 
     bool m_framebufferResized = false;
 

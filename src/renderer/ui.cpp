@@ -249,7 +249,8 @@ void UI::update(const UIData& data, uint32_t screenWidth, uint32_t screenHeight)
       displayedFps == m_displayedFps &&
       data.playerPosition == m_displayedPlayerPosition &&
       data.playerVelocity == m_displayedPlayerVelocity &&
-      data.viewDirection == m_displayedViewDirection) {
+      data.viewDirection == m_displayedViewDirection &&
+      data.flying == m_displayedFlying) {
     return;
   }
 
@@ -334,6 +335,16 @@ void UI::update(const UIData& data, uint32_t screenWidth, uint32_t screenHeight)
           static_cast<int>(m_playerVelocityBuffer.size() - 1));
       m_displayedPlayerVelocity = data.playerVelocity;
     }
+    if (data.flying != m_displayedFlying || m_flightModeLength == 0) {
+      m_flightModeLength = std::snprintf(m_flightModeBuffer.data(),
+                                         m_flightModeBuffer.size(), "%s",
+                                         data.flying ? "Mode: Flying (shift = down)"
+                                                     : "Mode: Walking (f = fly)");
+      m_flightModeLength = std::clamp(
+          m_flightModeLength, 0,
+          static_cast<int>(m_flightModeBuffer.size() - 1));
+      m_displayedFlying = data.flying;
+    }
     Clay_String fpsString = Clay_String{
         .isStaticallyAllocated = false,
         .length = static_cast<int32_t>(m_fpsLength),
@@ -361,6 +372,10 @@ void UI::update(const UIData& data, uint32_t screenWidth, uint32_t screenHeight)
         .isStaticallyAllocated = false,
         .length = static_cast<int32_t>(m_playerVelocityLength),
         .chars = m_playerVelocityBuffer.data()};
+    const Clay_String flightModeString{
+        .isStaticallyAllocated = false,
+        .length = static_cast<int32_t>(m_flightModeLength),
+        .chars = m_flightModeBuffer.data()};
     CLAY({.id = CLAY_ID("DebugContainer"),
           .layout = {
               .padding = {.left = 10, .right = 10, .top = 4, .bottom = 4},
@@ -377,6 +392,9 @@ void UI::update(const UIData& data, uint32_t screenWidth, uint32_t screenHeight)
       CLAY_TEXT(viewDirectionString, CLAY_TEXT_CONFIG({.textColor = {245, 245, 245, 255},
                                                        .fontSize = 14,
                                                        .letterSpacing = 0}));
+      CLAY_TEXT(flightModeString, CLAY_TEXT_CONFIG({.textColor = {190, 220, 255, 255},
+                                                   .fontSize = 14,
+                                                   .letterSpacing = 0}));
     }
   }
 
