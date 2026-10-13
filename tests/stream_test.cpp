@@ -52,12 +52,12 @@ class FakeRenderer {
             // processed, whatever the outcome, and only accepted ones as
             // uploaded. That is what makes a refusal recoverable.
             update.uploaded = false;
-            state.processedRoots.push_back(update.rootIndex);
+            state.processedRefs.push_back({update.rootIndex, update.lodLevel});
             if (update.remove) continue;
             if (static_cast<int>(m_accepted) >= m_acceptLimit) continue;
             ++m_accepted;
             update.uploaded = true;
-            state.uploadedRoots.push_back(update.rootIndex);
+            state.uploadedRefs.push_back({update.rootIndex, update.lodLevel});
         }
         state.bricks.clear();
     }
@@ -82,26 +82,30 @@ class BoundedRenderer {
     explicit BoundedRenderer(std::size_t capacity) : m_capacity(capacity) {}
 
     void drain(RenderState& state) {
-        state.evictedRoots.clear();
+        state.evictedRefs.clear();
         for (BrickUpdate& update : state.bricks) {
             update.uploaded = false;
-            state.processedRoots.push_back(update.rootIndex);
+            state.processedRefs.push_back({update.rootIndex, update.lodLevel});
             if (update.remove) {
                 for (auto it = m_held.begin(); it != m_held.end(); ++it)
-                    if (*it == update.rootIndex) { m_held.erase(it); break; }
+                    if (it->rootIndex == update.rootIndex &&
+                        it->level == update.lodLevel) {
+                        m_held.erase(it);
+                        break;
+                    }
                 continue;
             }
             if (m_held.size() >= m_capacity && !m_held.empty()) {
                 // Drop the oldest to make room, and report it, exactly as the
                 // real arena's LRU does.
-                const std::uint32_t victim = m_held.front();
+                const BrickRef victim = m_held.front();
                 m_held.erase(m_held.begin());
-                state.evictedRoots.push_back(victim);
+                state.evictedRefs.push_back(victim);
             }
-            m_held.push_back(update.rootIndex);
+            m_held.push_back({update.rootIndex, update.lodLevel});
             ++m_accepted;
             update.uploaded = true;
-            state.uploadedRoots.push_back(update.rootIndex);
+            state.uploadedRefs.push_back({update.rootIndex, update.lodLevel});
         }
         state.bricks.clear();
     }
@@ -111,23 +115,28 @@ class BoundedRenderer {
   private:
     std::size_t m_capacity;
     std::size_t m_accepted = 0;
-    std::vector<std::uint32_t> m_held;
+    std::vector<BrickRef> m_held;
 };
 
 } // namespace
 
 int main() {
     const std::uint16_t port = 28911;
-    // Sizing is load-bearing for case 3. The client's interest radius is 6
-    // bricks, so a brick is only evicted once the centre travels more than
-    // (6 + 1) * brick blocks; the walk covers twice that to guarantee the
-    // window has turned over completely. A 32-cell brick keeps that distance
-    // small enough to walk in a sane time, which matters because the authority
-    // ticks in real time and the player cannot be teleported -- it owns the
-    // position. The world is wide enough for both legs plus a margin, and tall
+    // Sizing is load-bearing for case 3. The window turns over completely
+    // once the centre travels more than twice (radius + 1) bricks, and the
+    // authority ticks in real time -- the player flies 16 blocks/s and cannot
+    // be teleported, so every block of turnover is wall-clock time. Radius 1
+    // with a 32-cell brick puts turnover at 128 blocks, ~8 s a leg; the
+    // default radius 6 would need 448 blocks a leg and the walk alone would
+    // cost a minute. What is under test -- capacity eviction and redelivery on
+    // return -- does not depend on the radius, only on the window turning
+    // over, so the small window measures the same property in a quarter of
+    // the time. The world is wide enough for both legs plus a margin, and tall
     // enough for the climb that clears terrain.
     constexpr std::uint32_t kBrick = 32;
-    constexpr float kTurnOverBlocks = 2.0f * 7.0f * static_cast<float>(kBrick);
+    constexpr std::uint8_t kRadius = 1;
+    constexpr float kTurnOverBlocks =
+        2.0f * static_cast<float>(kRadius + 1) * static_cast<float>(kBrick);
     const WorldSpec spec{2048, 1024, 384, kBrick};
     Server server(port, spec, 0xBEEF01);
     server.start();
@@ -137,6 +146,7 @@ int main() {
     }
 
     Client client(Peer{"127.0.0.1", port});
+    client.setInterestRadius(kRadius);
     client.start();
 
     for (int i = 0; i < 200 && !client.renderState().sizeX; ++i) sleepMs(20);
@@ -157,6 +167,7 @@ int main() {
         std::size_t delivered = 0;
         for (int i = 0; i < 100; ++i) {
             client.updateRender(1.0f / 60.0f);
+            client.drainBricks(client.renderState().bricks);
             delivered += client.renderState().bricks.size();
             renderer.drain(client.renderState());
             client.confirmUploads();
@@ -175,7 +186,7 @@ int main() {
             server.stop();
             return 1;
         }
-        if (!client.renderState().uploadedRoots.empty()) {
+        if (!client.renderState().uploadedRefs.empty()) {
             std::printf("uploads reported despite a refusing renderer\n");
             client.stop();
             server.stop();
@@ -199,6 +210,7 @@ int main() {
         const int before = renderer.accepted();
         for (int i = 0; i < 300; ++i) {
             client.updateRender(1.0f / 60.0f);
+            client.drainBricks(client.renderState().bricks);
             renderer.drain(client.renderState());
             client.confirmUploads();
             ++rounds;
@@ -236,6 +248,7 @@ int main() {
         BoundedRenderer renderer(24);
         for (int i = 0; i < 100; ++i) {
             client.updateRender(1.0f / 60.0f);
+            client.drainBricks(client.renderState().bricks);
             renderer.drain(client.renderState());
             client.confirmUploads();
             sleepMs(10);
@@ -283,6 +296,7 @@ int main() {
                 intent.rawMove.axes = {0.0f, dir};
                 client.submit(intent, 1.0f / 60.0f);
                 client.updateRender(1.0f / 60.0f);
+                client.drainBricks(client.renderState().bricks);
                 renderer.drain(client.renderState());
                 client.confirmUploads();
                 sleepMs(20);
@@ -336,6 +350,7 @@ int main() {
         const int beforeReturn = renderer.accepted();
         for (int i = 0; i < 200; ++i) {
             client.updateRender(1.0f / 60.0f);
+            client.drainBricks(client.renderState().bricks);
             renderer.drain(client.renderState());
             client.confirmUploads();
             if (renderer.accepted() > beforeReturn) break;
@@ -361,9 +376,17 @@ int main() {
     {
         FakeRenderer renderer(0);   // nothing drains, so the queue fills
         std::size_t offered = 0;
+        std::size_t peak = 0;
+        std::vector<BrickUpdate> queued;
         for (int i = 0; i < 200; ++i) {
             client.updateRender(1.0f / 60.0f);
-            offered += client.renderState().bricks.size();
+            client.drainBricks(queued);
+            offered += queued.size();
+            // Read off the client itself: draining moves bricks into `queued`
+            // (and unplaced ones straight back), so the drain cannot observe
+            // the bound it relieves -- only the client can say how deep its
+            // own queue is.
+            peak = std::max(peak, client.pendingQueueSize());
             sleepMs(10);
         }
         // The bound is on *uploads*: frees are tracked separately and may take the
@@ -372,26 +395,32 @@ int main() {
         // acknowledged (which is what leaves a permanent hole).
         constexpr std::size_t kUploadBound = 256;
         constexpr std::size_t kFreeSlack = 256;
-        if (client.renderState().bricks.size() > kUploadBound + kFreeSlack) {
+        if (peak > kUploadBound + kFreeSlack) {
             std::printf("case 4: queue grew to %zu, past the bound of %zu\n",
-                        client.renderState().bricks.size(),
-                        kUploadBound + kFreeSlack);
+                        peak, kUploadBound + kFreeSlack);
+            client.stop();
+            server.stop();
+            return 1;
+        }
+        std::printf("case 4: queue peaked at %zu (bound %zu) under overflow, "
+                    "0 acknowledged\n", peak, kUploadBound + kFreeSlack);
+        // Vacuity guard: a peak of zero means nothing arrived at all, and the
+        // bound below would pass without ever being exercised.
+        if (peak == 0) {
+            std::printf("case 4: nothing arrived; overflow untested\n");
             client.stop();
             server.stop();
             return 1;
         }
         // Nothing was ever acknowledged, so the server still owes us all of
         // it -- which is the property that makes the overflow recoverable.
-        if (!client.renderState().uploadedRoots.empty()) {
+        if (!client.renderState().uploadedRefs.empty()) {
             std::printf("case 4: uploads acknowledged with no renderer\n");
             client.stop();
             server.stop();
             return 1;
         }
-        std::printf("case 4: queue held at %zu (bound %zu) under overflow, "
-                    "0 acknowledged\n",
-                    client.renderState().bricks.size(),
-                    kUploadBound + kFreeSlack);
+        
     }
 
     client.stop();

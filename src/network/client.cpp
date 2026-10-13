@@ -135,9 +135,15 @@ void Client::worldReceiveLoop() {
         m_render.rootDimY = descriptor.rootDimY;
         m_render.rootDimZ = descriptor.rootDimZ;
         m_render.rootCount = descriptor.rootCount;
-        m_interestRadius = static_cast<std::uint8_t>(
-            std::min<std::uint8_t>(m_interestRadius,
-                                  static_cast<std::uint8_t>(6)));
+        // Clamp the requested radius to the world rather than to a constant.
+        // The old cap of 6 was the bug: it silently truncated a window the
+        // caller had sized to the view distance, leaving the renderer drawing
+        // bricks that could never arrive. A window larger than the world is
+        // merely wasteful, not wrong, so the clamp is against the geometry.
+        const auto maxRadius = static_cast<std::uint8_t>(std::max<std::uint32_t>(
+            1u, std::max({m_spec.rootDimX(), m_spec.rootDimY(),
+                          m_spec.rootDimZ()})));
+        m_interestRadius = std::min<std::uint8_t>(m_interestRadius, maxRadius);
         // Handed to the renderer once; the renderer clears it after upload.
         m_render.materials = std::move(descriptor.materials);
     }
@@ -214,12 +220,29 @@ void Client::enqueueBrick(BrickSnapshot snapshot) {
     const voxel::WorldSpec spec = m_streamSpec;
     if (spec.rootCount() == 0 || snapshot.rootIndex >= spec.rootCount())
         return;
+    // A frame carries one payload, and it has to be the one the level names.
+    // An octree at level 3 is a frame that says the wrong thing about itself,
+    // and a grid at level 0 would be an averaged stand-in for the exact
+    // geometry the client needs at its feet.
+    // The server sends exactly one payload, and it must be the one the level
+    // names: an octree for level 0, one grid at the named level otherwise. A
+    // frame with both, with neither, or with a grid at the wrong level is a
+    // corrupt frame, and accepting it would book a level the payload does not
+    // describe -- the ack would then confirm data the client never held.
+    const bool shapeOk =
+        snapshot.lodLevel == 0
+            ? (!snapshot.nodes.empty() && snapshot.levels.empty())
+            : (snapshot.nodes.empty() && snapshot.levels.size() == 1 &&
+               snapshot.levels.front().level == snapshot.lodLevel);
+    if (!shapeOk) return;
     std::scoped_lock lock(m_mutex);
+
+    const std::uint64_t key = levelKey(snapshot.rootIndex, snapshot.lodLevel);
 
     // Three ways a frame can be redundant, and they are not the same thing:
     //
-    //  * Already in the GPU pool at this revision: nothing to do. This is the
-    //    only case that may drop the frame outright.
+    //  * Already on the GPU at this level and revision: nothing to do. This is
+    //    the only case that may drop the frame outright.
     //  * Queued or in flight: the server resent something we have not finished
     //    with. Dropping it is right, but it must *not* be treated as delivered.
     //  * Evicted and back: accepted again, which is the whole point of the
@@ -230,11 +253,18 @@ void Client::enqueueBrick(BrickSnapshot snapshot) {
     // remained, so the resend was dismissed as a duplicate forever: the client
     // waited for an upload that could not arrive and the server waited for an
     // ack that was never coming.
+    //
+    // The level is part of the identity, not a detail of it. Holding this brick
+    // at level 5 says nothing about whether it holds level 1, and a client that
+    // only tracked the root index would refuse the finer delivery as a
+    // duplicate the moment the player walked close enough to want it -- which
+    // is exactly the moment it matters.
     const auto resident = m_resident.find(snapshot.rootIndex);
     if (resident != m_resident.end() &&
+        (resident->second.levels & (1u << snapshot.lodLevel)) != 0 &&
         resident->second.revision == snapshot.revision)
         return;
-    const auto inFlight = m_awaitingUpload.find(snapshot.rootIndex);
+    const auto inFlight = m_awaitingUpload.find(key);
     if (inFlight != m_awaitingUpload.end() &&
         inFlight->second == snapshot.revision)
         return;
@@ -247,7 +277,7 @@ void Client::enqueueBrick(BrickSnapshot snapshot) {
     // they stayed magenta for the rest of the session. A brick that has been
     // received but not queued is simply never acknowledged, which makes the
     // server retry it on its next pass.
-    if (m_render.bricks.size() >= kMaxPendingBricks) {
+    if (m_pendingBricks.size() >= kMaxPendingBricks) {
         m_uploadOverflow = true;
         return;
     }
@@ -255,69 +285,123 @@ void Client::enqueueBrick(BrickSnapshot snapshot) {
     voxel::BrickUpdate update{};
     update.rootIndex = snapshot.rootIndex;
     update.revision = snapshot.revision;
-    // Carried through so the renderer can tell a full-resolution brick from a
-    // reduced one, and so a test can see what the server actually shipped.
+    // Carried through so the renderer can tell a full-resolution brick from an
+    // averaged one, and so a test can see what the server actually shipped.
     update.lodLevel = snapshot.lodLevel;
-    update.nodes = std::move(snapshot.nodes);
-    m_render.bricks.push_back(std::move(update));
+    if (snapshot.lodLevel == 0) {
+        update.nodes = std::move(snapshot.nodes);
+    } else {
+        update.edge = snapshot.levels.front().edge;
+        update.cells = std::move(snapshot.levels.front().cells);
+    }
+    m_pendingBricks.push_back(std::move(update));
     // Not acknowledged here. The ack waits for the renderer to report the
     // upload in `confirmUploads`, so the server's idea of what we hold cannot
     // outrun what is actually on the GPU.
-    m_awaitingUpload.emplace(snapshot.rootIndex, snapshot.revision);
+    m_awaitingUpload.emplace(key, snapshot.revision);
+}
+
+void Client::drainBricks(std::vector<BrickUpdate>& out) {
+    std::scoped_lock lock(m_mutex);
+    // Whatever is still in `out` is a brick the renderer *could not place* last
+    // frame and chose to keep queued. It must go back at the front, ahead of
+    // anything newly received, or it is silently dropped: the client never
+    // acknowledged it, so the server still thinks it is in flight and declines
+    // to re-offer it, and the brick is simply lost. Retrying it here is the
+    // client's own retry path and does not depend on the server noticing.
+    //
+    // This is the other half of the swap. Ownership still moves rather than
+    // being shared: at no point do two threads hold the same vector.
+    if (!out.empty()) {
+        out.insert(out.end(),
+                   std::make_move_iterator(m_pendingBricks.begin()),
+                   std::make_move_iterator(m_pendingBricks.end()));
+        m_pendingBricks.clear();
+    }
+    out.swap(m_pendingBricks);
+}
+
+std::size_t Client::pendingQueueSize() const {
+    std::scoped_lock lock(m_mutex);
+    return m_pendingBricks.size();
 }
 
 void Client::confirmUploads() {
     std::scoped_lock lock(m_mutex);
 
-    // The revision a brick was uploaded at. Taken before the in-flight set is
-    // cleared below, since that is where the revision is still known.
-    std::unordered_map<std::uint32_t, std::uint32_t, RegionKeyHash> confirmed;
-    for (std::uint32_t rootIndex : m_render.uploadedRoots) {
-        const auto pending = m_awaitingUpload.find(rootIndex);
+    // The revision each delivered level was uploaded at. Taken before the
+    // in-flight set is cleared below, since that is where the revision is still
+    // known.
+    std::unordered_map<std::uint64_t, std::uint32_t, LevelKeyHash> confirmed;
+    for (const BrickRef& ref : m_render.uploadedRefs) {
+        const auto pending = m_awaitingUpload.find(levelKey(ref.rootIndex,
+                                                            ref.level));
         if (pending == m_awaitingUpload.end()) continue;   // evicted meanwhile
-        confirmed.emplace(rootIndex, pending->second);
+        confirmed.emplace(levelKey(ref.rootIndex, ref.level), pending->second);
     }
 
-    // Evictions the renderer made to fit something else. A brick here was
+    // The levels the renderer dropped, grouped per brick. A level here was
     // acknowledged once and then thrown away, so it is no longer held -- the
     // record must go or the next resend is dismissed as a duplicate.
     //
     // One case is deliberately excluded: a brick evicted and re-placed in the
     // same frame. The renderer evicts while processing the queue in order, so
     // a brick dropped for an earlier update can be re-uploaded by a later one,
-    // and it then appears in `uploadedRoots` too. It is resident, so it is
+    // and it then appears in `uploadedRefs` too. It is resident, so it is
     // acknowledged and not forgotten; forgetting it would only cost a
     // redundant resend.
-    for (std::uint32_t rootIndex : m_render.evictedRoots) {
-        if (confirmed.find(rootIndex) != confirmed.end()) continue;
-        m_resident.erase(rootIndex);
-        m_awaitingUpload.erase(rootIndex);
+    std::unordered_map<std::uint32_t, std::uint8_t, RegionKeyHash> evicted;
+    std::unordered_set<std::uint32_t> replaced;
+    for (const BrickRef& ref : m_render.evictedRefs) {
+        evicted[ref.rootIndex] |= static_cast<std::uint8_t>(1u << ref.level);
+    }
+    for (const auto& [key, revision] : confirmed) {
+        const auto rootIndex = static_cast<std::uint32_t>(key >> 3);
+        replaced.insert(rootIndex);
+    }
+    for (const auto& [rootIndex, levels] : evicted) {
+        if (replaced.find(rootIndex) != replaced.end()) continue;
+        auto resident = m_resident.find(rootIndex);
+        if (resident == m_resident.end()) continue;
+        resident->second.levels &= static_cast<std::uint8_t>(~levels);
+        for (std::uint8_t level = 0; level < voxel::kLodLevels; ++level) {
+            if ((levels & (1u << level)) != 0)
+                m_awaitingUpload.erase(levelKey(rootIndex, level));
+        }
+        // One forget per brick, not per level. WorldForget retires the server's
+        // whole record for the brick, so a second one for the same root index
+        // would say nothing the first did not.
         m_pendingForgets.push_back(rootIndex);
     }
 
-    // Only a brick the renderer placed in the pool is recorded as held and
+    // Only a level the renderer placed in the pool is recorded as held and
     // acknowledged. This is the sole source of both facts.
-    for (const auto& [rootIndex, revision] : confirmed) {
-        m_resident[rootIndex].revision = revision;
-        m_pendingAcks.push_back(WorldAck{m_uuid, m_playerId, rootIndex, revision});
+    for (const auto& [key, revision] : confirmed) {
+        const auto rootIndex = static_cast<std::uint32_t>(key >> 3);
+        const auto level = static_cast<std::uint8_t>(key & 0x7u);
+        Resident& entry = m_resident[rootIndex];
+        entry.revision = revision;
+        entry.levels |= static_cast<std::uint8_t>(1u << level);
+        m_pendingAcks.push_back(
+            WorldAck{m_uuid, m_playerId, rootIndex, revision, level});
     }
 
     // Everything the renderer finished with is no longer queued, so nothing
     // awaits an upload that will never arrive -- including bricks it refused.
     // Clearing these is what keeps a refused brick eligible for the server's
     // next resend rather than dismissing it as a duplicate forever.
-    for (std::uint32_t rootIndex : m_render.processedRoots) {
-        m_awaitingUpload.erase(rootIndex);
+    for (const BrickRef& ref : m_render.processedRefs) {
+        m_awaitingUpload.erase(levelKey(ref.rootIndex, ref.level));
         // Frees carry no data, so they are tracked by index and retired as
         // soon as the renderer reports them. This keeps the upload bound
         // accounting for uploads alone.
-        if (m_pendingFrees.erase(rootIndex) > 0 && m_evictionBacklog > 0)
+        if (m_pendingFrees.erase(ref.rootIndex) > 0 && m_evictionBacklog > 0)
             --m_evictionBacklog;
     }
 
-    m_render.processedRoots.clear();
-    m_render.uploadedRoots.clear();
-    m_render.evictedRoots.clear();
+    m_render.processedRefs.clear();
+    m_render.uploadedRefs.clear();
+    m_render.evictedRefs.clear();
 }
 
 void Client::submit(const InputIntent& intent, float frameSeconds) {

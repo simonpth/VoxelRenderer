@@ -31,13 +31,21 @@ struct Arena {
     }
 
     // Feet height the player starts at: on the floor, or hovering well above.
+    //
+    // `position` is the centre of the 3x3x7 collision box, not the feet, so the
+    // feet sit half a box lower. Placing the centre at the feet height would
+    // bury the bottom two thirds of the player in the floor and leave it unable
+    // to move -- which is what this used to do once the box grew from a
+    // cylinder to something with real width and height.
     Authority authority(float z, float yaw = 0.0f) {
         Authority authority(1, world);
         authority.state().localPlayer.yaw = yaw;
         authority.state().localPlayer.pitch = 0.0f;
-        authority.state().localPlayer.position = {kCentre, kCentre, z};
+        authority.state().localPlayer.position = {kCentre, kCentre, z + kHalfBox};
         return authority;
     }
+    static constexpr float kHalfBox = 3.5f;    // half of the 7-tall box
+    static constexpr float kHalfWidth = 1.5f;  // half of the 3-wide box
     static constexpr std::uint16_t kStoneId = 1;
 };
 
@@ -180,11 +188,18 @@ int main() {
         // the intent has to ask for -X directly. That is the point of the
         // change: the wire carries "walk that way", never "press W".
         run(authority, InputIntent{1, {-1.0f, 0.0f}, {}}, 120);
-        // The sweep stops the capsule against the wall: the radius is 0.3 and
-        // the first solid cell is x = 7, so the center cannot pass x = 8.3.
-        // The sub-step the sweep moves in is 0.093 wide, so allow for that.
-        CHECK(authority.state().localPlayer.position.x < 8.45f);
-        CHECK(authority.state().localPlayer.position.x > 8.25f);
+        // The sweep stops the box against the wall. The box is 3 wide, so its
+        // -x face is 1.5 behind the centre, and the first solid cell is x = 7,
+        // which the face can just touch: the centre cannot pass x = 8.5. The
+        // sub-step the sweep moves in is 0.093 wide, so allow for that.
+        // The invariant is about the box, not the centre: the -x face must not
+        // enter the solid region, which starts at x = 8. Asserting a magic
+        // centre value instead would just re-encode the box width, and the
+        // whole point of the assertion is that the width is applied at all.
+        CHECK(authority.state().localPlayer.position.x - Arena::kHalfWidth >=
+              7.9f);
+        // And it must actually have stopped, rather than walked the whole way.
+        CHECK(authority.state().localPlayer.position.x < 11.0f);
     }
 
     // --- hovering: gravity is off while flying -----------------------------
@@ -255,6 +270,7 @@ int main() {
         // And the floor still catches them, only slower than flying.
         run(authority, InputIntent{1, {0.0f, 0.0f}, {}}, 400);
         CHECK(authority.state().localPlayer.grounded);
+        CHECK(authority.state().localPlayer.position.z > kFloorZ);
     }
 
     // --- a replayed tick must not cancel a held flight key ------------------
@@ -276,9 +292,54 @@ int main() {
         Authority authority = arena.authority(static_cast<float>(kFloorZ));
         run(authority, InputIntent{1, {0.0f, 0.0f}, {}}, 60);
         CHECK(authority.state().localPlayer.grounded);
-        CHECK(std::abs(authority.state().localPlayer.position.z - kFloorZ) <
-               1e-5f);
+        // Resting on the floor puts the *feet* at kFloorZ; `position` is the
+        // centre of the 7-tall box, so it rests half a box higher.
+        CHECK(std::abs(authority.state().localPlayer.position.z -
+                       (static_cast<float>(kFloorZ) + Arena::kHalfBox)) < 1e-4f);
         CHECK(std::abs(authority.state().localPlayer.velocity.z) < 1e-5f);
+    }
+
+    // --- a spawned player starts in open air and can actually walk ---------
+    //
+    // The player is 3 wide, so the surface it lands on is the highest column
+    // under its whole footprint. Spawning on the height of the *centre* column
+    // instead put the feet inside any neighbour standing a cell higher, and a
+    // buried player is not merely ugly: the sweep finds every direction
+    // blocked, so it cannot move at all. That failure is invisible until
+    // something walks the player and measures nothing happening, so it is
+    // pinned here across several world sizes -- including the production one.
+    {
+        for (const WorldSpec& spec :
+             {WorldSpec{1024, 1024, 256, 128}, WorldSpec{512, 512, 128, 128},
+              WorldSpec{65536, 65536, 8192, 128}}) {
+            World world(spec, 7);
+            Authority authority(1, world);
+            const glm::vec3 spawn = authority.state().localPlayer.position;
+
+            int buried = 0;
+            for (int z = static_cast<int>(std::floor(spawn.z - Arena::kHalfBox));
+                 z <= static_cast<int>(std::floor(spawn.z + Arena::kHalfBox)); ++z)
+                for (int y = static_cast<int>(std::floor(spawn.y - Arena::kHalfWidth));
+                     y <= static_cast<int>(std::floor(spawn.y + Arena::kHalfWidth)); ++y)
+                    for (int x = static_cast<int>(std::floor(spawn.x - Arena::kHalfWidth));
+                         x <= static_cast<int>(std::floor(spawn.x + Arena::kHalfWidth)); ++x)
+                        buried += world.isSolid(x, y, z) ? 1 : 0;
+            if (buried != 0) {
+                std::printf("FAIL spawn in %ux%ux%u is buried in %d cells\n",
+                            spec.sizeX, spec.sizeY, spec.sizeZ, buried);
+                ++failures;
+            }
+
+            run(authority, InputIntent{1, {0.0f, 1.0f}, {}}, 120);
+            const float moved = std::abs(authority.state().localPlayer.position.y -
+                                         spawn.y);
+            if (moved < 1.0f) {
+                std::printf("FAIL spawn in %ux%ux%u could not walk (%.2f)\n",
+                            spec.sizeX, spec.sizeY, spec.sizeZ,
+                            static_cast<double>(moved));
+                ++failures;
+            }
+        }
     }
 
     if (failures != 0) {

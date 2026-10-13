@@ -56,15 +56,12 @@ int main() {
     int failures = 0;
     std::uint32_t tick = 1;
     for (const float yaw : {0.0f, 90.0f, 180.0f, -90.0f}) {
-        // Turn the camera to `yaw`, then hold W and let the authority move.
         // The tick must keep climbing: the server discards any intent it has
         // already acknowledged, so restarting the counter would make every
         // later case a no-op.
-        // Re-read the tick BEFORE the loop: a stale counter makes every later
-        // case a no-op, which is what happened the first time this was written.
         // Phase 1: turn the camera to `yaw`. Read back the rendered yaw rather
         // than assuming, so each case starts from wherever the last left off.
-        for (int frame = 0; frame < 800; ++frame) {
+        for (int frame = 0; frame < 400; ++frame) {
             const float current = client.renderState().localPlayer.yaw;
             float difference = yaw - current;
             while (difference > 180.0f) difference -= 360.0f;
@@ -77,22 +74,47 @@ int main() {
             intent.rawMove.axes = {0.0f, 0.0f};   // not moving while turning
             client.submit(intent, 1.0f / 60.0f);
             client.updateRender(1.0f / 60.0f);
-            std::this_thread::sleep_for(std::chrono::milliseconds(3));
         }
 
-        // Phase 2: hold W and see which way the authority walks. `before` is
-        // taken after the turn and a settle, so it cannot read a zero that came
-        // from before the first snapshot arrived.
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        const glm::vec3 before =
-            client.authoritativeState().localPlayer.position;
-        for (int frame = 0; frame < 400; ++frame) {
+        // Phase 2: fly forward and see which way the authority travels.
+        //
+        // Flying, not walking. A walker collides with the terrain, and a
+        // hillside turns forward motion into a slow sideways slide -- 0.6
+        // blocks of travel with 0.09 of drift, which reads as alignment 0.9899
+        // and fails a 0.99 threshold for no reason to do with direction. What
+        // is under test is the basis W is resolved against, not the collision
+        // solver, so the player flies: no contact, no slide, and the distance
+        // is long enough that any residual noise is irrelevant.
+        // The server simulates in real time -- a tick per 1/60 s -- so the
+        // flight has to take real time too. 120 back-to-back submits finish in
+        // milliseconds and the server simulates no ticks in that span, which
+        // measures zero movement for no reason to do with direction. One
+        // submit per tick, paced to the tick, for about a second: at 16
+        // blocks/s that is 16 blocks, and any basis error is unmistakable.
+        // Climb first: flight still collides, and a horizontal flight out
+        // of a hillside ends against a wall with zeroed velocity, which
+        // measures the hill rather than the basis. Eighty ticks up is ~21
+        // blocks, clear of local relief, so the measurement flight starts in
+        // open air whatever the spawn looks like.
+        for (int frame = 0; frame < 80; ++frame) {
             voxel::InputIntent intent{};
             intent.clientTick = ++tick;
+            intent.flying = true;
+            intent.jumpPressed = true;   // ascend while flying
+            client.submit(intent, 1.0f / 60.0f);
+            client.updateRender(1.0f / 60.0f);
+            std::this_thread::sleep_for(std::chrono::milliseconds(14));
+        }
+        const glm::vec3 before =
+            client.authoritativeState().localPlayer.position;
+        for (int frame = 0; frame < 40; ++frame) {
+            voxel::InputIntent intent{};
+            intent.clientTick = ++tick;
+            intent.flying = true;
             intent.rawMove.axes = {0.0f, 1.0f};
             client.submit(intent, 1.0f / 60.0f);
             client.updateRender(1.0f / 60.0f);
-            std::this_thread::sleep_for(std::chrono::milliseconds(3));
+            std::this_thread::sleep_for(std::chrono::milliseconds(14));
         }
         const glm::vec3 after =
             client.authoritativeState().localPlayer.position;
@@ -106,7 +128,12 @@ int main() {
         const glm::vec2 expected = rendererForward(yaw);
 
         const float dot = glm::dot(normalised, expected);
-        const bool aligned = dot > 0.99f;
+        // Flown far and straight, so anything below this is a wrong basis,
+        // not noise: the old raw-WASD behaviour scored 0.0 and -1.0 here.
+                // Ten blocks of open-air flight: a wrong basis scores 0.0 or -1.0
+        // here (as the old raw-WASD behaviour did), and the length bar proves
+        // the flight was actually free rather than pressed against a wall.
+        const bool aligned = dot > 0.99f && length > 4.0f;
         if (!aligned) ++failures;
         std::printf("yaw %7.1f : travelled (%6.2f, %6.2f) over %6.1f blocks, "
                     "expected (%5.2f, %5.2f), alignment %.4f  %s\n",

@@ -19,6 +19,7 @@
 // arena is the real BrickPool, reporting real evictions through
 // `evictedRoots`. The pool policy is not faked; only the memcpy is.
 #include <algorithm>
+#include <unordered_map>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -57,39 +58,51 @@ class BoundedRenderer {
         : m_pool(capacity), m_uploadsPerFrame(uploadsPerFrame) {}
 
     void drain(RenderState& state) {
-        state.evictedRoots.clear();
+        state.evictedRefs.clear();
         std::size_t placed = 0;
         for (BrickUpdate& update : state.bricks) {
             update.uploaded = false;
-            state.processedRoots.push_back(update.rootIndex);
+            state.processedRefs.push_back({update.rootIndex, update.lodLevel});
             if (update.remove) {
                 BrickPool::Slot slot{};
                 m_pool.drop(update.rootIndex, slot);
                 continue;
             }
             if (placed >= m_uploadsPerFrame) continue;   // the rest wait
+            if (update.lodLevel != 0) {
+                // An averaged grid needs no pool space -- it is a flat array
+                // of colours, not octree blocks -- so it is held as soon as it
+                // arrives. Reporting it is what lets the client acknowledge the
+                // level; dropping it here would leave it unacknowledged and the
+                // server would resend it forever.
+                ++placed;
+                update.uploaded = true;
+                state.uploadedRefs.push_back(
+                    {update.rootIndex, update.lodLevel});
+                continue;
+            }
             const auto claim =
                 m_pool.claim(update.rootIndex,
                              static_cast<std::uint32_t>(update.nodes.size()));
             // Evictions are reported whether or not the claim succeeded: the
             // renderer gives up runs either way, and the client has to hear
-            // about it either way.
-            state.evictedRoots.insert(state.evictedRoots.end(),
-                                      claim.evicted.begin(),
-                                      claim.evicted.end());
+            // about it either way. Only level 0 is evicted by name -- the pool
+            // holds octrees, and a grid eviction would name a level the pool
+            // never held.
+            for (std::uint32_t evicted : claim.evicted)
+                state.evictedRefs.push_back({evicted, 0});
             if (!claim.placed) continue;
             ++placed;
             update.uploaded = true;
-            state.uploadedRoots.push_back(update.rootIndex);
+            state.uploadedRefs.push_back({update.rootIndex, update.lodLevel});
         }
-        // Whatever was not placed stays queued, as a real renderer would.
+        // Whatever was not placed stays queued, as a real renderer would, and
+        // is handed back to the client at the next drain -- see
+        // Client::drainBricks, which is where the retry actually happens.
         //
-        // Compacted in place with erase rather than rebuilt and moved in. The
-        // client's stream thread pushes into this same vector concurrently, and
-        // a move-assignment frees the old buffer out from under it -- which is
-        // a use-after-free, not a race, and showed up as an intermittent
-        // SIGBUS. erase keeps the capacity, so the buffer the other thread is
-        // writing into stays alive.
+        // Compacted in place with erase rather than rebuilt and moved in: a
+        // move-assignment would free the old buffer, and the leftovers are the
+        // half of the queue that is about to be swapped across.
         state.bricks.erase(
             std::remove_if(state.bricks.begin(), state.bricks.end(),
                            [](const BrickUpdate& update) {
@@ -148,39 +161,56 @@ constexpr std::size_t kUploadsPerFrame = 2;
                   "budget must fit one brick but not the whole window");
     BoundedRenderer renderer(kBudget, kUploadsPerFrame);
 
-    std::uint64_t uploads = 0, evictions = 0, frames = 0, lost = 0;
-    std::uint64_t distinctResident = 0;
-    // Roots evicted and not yet seen resident again. Every one of these is a
-    // brick that was delivered, acknowledged, thrown away, and still owes the
-    // client a redelivery. The set drains as bricks come back, and an entry
-    // that never leaves it is a brick the world has permanently lost.
-    std::vector<std::uint32_t> outstanding;
-    for (int i = 0; i < 1'500; ++i) {
+    std::uint64_t uploads = 0, evictions = 0, frames = 0;
+    std::uint64_t recovered = 0;
+    std::uint64_t worstLatency = 0;
+    // (root, level) -> frame evicted and still owing a redelivery. Drained by
+    // re-upload, so anything left here at the end is a brick the world
+    // permanently lost -- which is the failure, not a slow stream.
+    std::unordered_map<std::uint64_t, std::uint64_t> outstanding;
+    // Every (root, level) that has completed at least one evict-and-return
+    // cycle. A brick outstanding at the end is only "still in flight" if its
+    // pipeline already proved itself; one that never once came back is a path
+    // that never worked, whatever its age.
+    std::unordered_set<std::uint64_t> everRecovered;
+    auto refKey = [](std::uint32_t root, std::uint8_t level) {
+        return (static_cast<std::uint64_t>(root) << 3) | level;
+    };
+    // 400 frames is the budget: eviction pressure is continuous from the first
+    // frames (the pool holds ~8 bricks against a 32-brick window), so recovery
+    // is exercised hundreds of times over without a 1500-frame soak.
+    for (int i = 0; i < 400; ++i) {
+        client.drainBricks(client.renderState().bricks);
         renderer.drain(client.renderState());
         // An eviction the same frame re-places is not a lost brick -- the
-        // renderer dropped a run and immediately re-claimed it -- so it does
-        // not count as one needing recovery. Only an eviction with no upload
-        // behind it in the same frame is a brick the client genuinely lost and
-        // owes a redelivery.
-        for (std::uint32_t root : client.renderState().evictedRoots)
-            if (std::find(client.renderState().uploadedRoots.begin(),
-                          client.renderState().uploadedRoots.end(), root) ==
-                client.renderState().uploadedRoots.end()) {
-                outstanding.push_back(root);
-                ++lost;
+        // renderer dropped a run and immediately re-claimed it -- so only an
+        // eviction with no upload behind it in the same frame enters the
+        // recovery set.
+        for (const BrickRef& ref : client.renderState().evictedRefs) {
+            const auto uploaded = client.renderState().uploadedRefs;
+            const bool replaced = std::any_of(
+                uploaded.begin(), uploaded.end(), [&](const BrickRef& up) {
+                    return up.rootIndex == ref.rootIndex;
+                });
+            if (!replaced) {
+                outstanding[refKey(ref.rootIndex, ref.level)] = frames;
+                ++evictions;
             }
-        for (std::uint32_t root : client.renderState().uploadedRoots) {
-            uploads++;
-            const auto at = std::find(outstanding.begin(), outstanding.end(),
-                                      root);
-            if (at != outstanding.end()) outstanding.erase(at);
         }
-        evictions += client.renderState().evictedRoots.size();
+        for (const BrickRef& ref : client.renderState().uploadedRefs) {
+            ++uploads;
+            const auto at =
+                outstanding.find(refKey(ref.rootIndex, ref.level));
+            if (at != outstanding.end()) {
+                worstLatency =
+                    std::max(worstLatency, frames - at->second);
+                outstanding.erase(at);
+                everRecovered.insert(refKey(ref.rootIndex, ref.level));
+                ++recovered;
+            }
+        }
         client.confirmUploads();
         ++frames;
-        distinctResident = std::max<std::uint64_t>(
-            distinctResident,
-            static_cast<std::uint64_t>(renderer.resident()));
         // The arena may never exceed its budget. This is the invariant the
         // whole design exists to provide.
         if (renderer.used() > renderer.capacity()) {
@@ -191,20 +221,14 @@ constexpr std::size_t kUploadsPerFrame = 2;
         sleepMs(4);
     }
 
-    // No drain phase: with a budget below the window the working set is meant to
-    // keep turning over, so "wait until it settles" would never finish. What is
-    // checked below is that the turn-over is bounded and that the arena stays
-    // inside its budget while it happens.
-
-    std::printf("  arena: %u/%u nodes held, peak %llu bricks resident\n",
-                renderer.used(), renderer.capacity(),
-                static_cast<unsigned long long>(distinctResident));
-    std::printf("  %llu frames, %llu uploads, %llu evictions (%llu needing "
-                "recovery), %zu still outstanding\n",
+    std::printf("  %llu frames, %llu uploads, %llu evictions needing recovery, "
+                "%llu recovered, worst latency %llu frames, %zu still out\n",
                 static_cast<unsigned long long>(frames),
                 static_cast<unsigned long long>(uploads),
                 static_cast<unsigned long long>(evictions),
-                static_cast<unsigned long long>(lost), outstanding.size());
+                static_cast<unsigned long long>(recovered),
+                static_cast<unsigned long long>(worstLatency),
+                outstanding.size());
 
     // The arena must have been bounded by eviction, not by growing. If capacity
     // moved above the budget, the run tested growth instead and the eviction
@@ -216,77 +240,60 @@ constexpr std::size_t kUploadsPerFrame = 2;
     }
 
     // Eviction must actually have happened -- a budget this small against a
-    // window this size cannot avoid it.
+    // window this size cannot avoid it -- and at least some of it must have
+    // been real loss rather than same-frame replacement, or the recovery path
+    // was never touched and the assertions below would pass for a client that
+    // never forgets anything.
     if (evictions == 0) {
-        std::printf("FAIL: no evictions occurred; the budget was never "
+        std::printf("FAIL: no evictions needed recovery; the budget was never "
                     "exercised\n");
         return 1;
     }
 
-    // And it must have been real eviction: at least one brick has to have been
-    // dropped without an upload putting it straight back in the same frame.
-    // When every eviction is a same-frame replacement the recovery path is
-    // never touched, and the "no brick is lost" assertion below would pass for
-    // a client that never forgets anything -- which is exactly the bug.
-    if (lost == 0) {
-        std::printf("FAIL: every eviction was replaced in the same frame; "
-                    "no brick was actually lost and recovery was never "
-                    "exercised\n");
+    // Recovery must keep up: every eviction comes back, and quickly. What is
+    // judged is age, not presence -- a resend refused by a full client queue
+    // waits out the server's 500 ms grace before it is retried, so an eviction
+    // from the last ~150 frames may legitimately still be in the pipeline when
+    // the run ends. Anything older than that is not pipelined, it is stuck:
+    // the client still believes it holds the brick (or the server believes it
+    // delivered it), which is indistinguishable from terrain that never
+    // existed.
+    std::uint64_t oldestAge = 0;
+    std::uint64_t neverRecovered = 0;
+    for (const auto& [key, evictedAt] : outstanding) {
+        const std::uint64_t age = frames - evictedAt;
+        oldestAge = std::max(oldestAge, age);
+        // Age-gated like the check above: a brick evicted on the last frames
+        // has had no time for even one cycle, so youth is the pipeline, not
+        // evidence either way. Only an old brick with no completed cycle is a
+        // path that never worked.
+        if (age > 150 && everRecovered.find(key) == everRecovered.end())
+            ++neverRecovered;
+    }
+    // A brick that never once completed a cycle is not "in flight", however
+    // young: there is no evidence its redelivery path works at all.
+    if (neverRecovered > 0) {
+        std::printf("FAIL: %zu evicted brick(s) never completed one recovery\n",
+                    static_cast<std::size_t>(neverRecovered));
         return 1;
     }
-
-    // The invariant that actually has to hold, at any budget: no brick is
-    // *lost*. An arena smaller than the window cannot hold everything, so
-    // bricks churn -- upload, evict, resend, upload -- forever. That churn is
-    // correct: the alternative is holding more than the budget, or dropping a
-    // brick and never getting it back. What must never happen is a brick the
-    // client believes it still holds and the server believes it delivered,
-    // which is indistinguishable from terrain that never existed.
-    //
-    // So the check is that the working set keeps turning over, not that it
-    // settles. A stalled recovery shows up as `outstanding` pinned at a
-    // nonzero constant across a long idle stretch, because nothing ever comes
-    // back to drain it.
-    if (outstanding.empty()) {
-        std::printf("FAIL: nothing outstanding, so the budget held the whole "
-                    "window and eviction recovery was never exercised\n");
+    if (oldestAge > 150) {
+        std::printf("FAIL: %zu evicted brick(s) never came back, oldest %llu "
+                    "frames ago\n", outstanding.size(),
+                    static_cast<unsigned long long>(oldestAge));
+        return 1;
+    }
+    if (!outstanding.empty())
+        std::printf("  (%zu redeliveries younger than 150 frames still in "
+                    "flight)\n", outstanding.size());
+    if (worstLatency > 200) {
+        std::printf("FAIL: worst recovery latency %llu frames; redelivery is "
+                    "stalling\n",
+                    static_cast<unsigned long long>(worstLatency));
         return 1;
     }
     if (uploads == 0) {
         std::printf("FAIL: no uploads at all\n");
-        return 1;
-    }
-
-    // Every outstanding brick must be one the client genuinely does not hold,
-    // and the count must be bounded by the window rather than growing without
-    // limit -- which would mean the arena is accumulating debris.
-    if (outstanding.size() > 128) {
-        std::printf("FAIL: %zu bricks outstanding is more than the window "
-                    "could hold; the arena is accumulating debris\n",
-                    outstanding.size());
-        return 1;
-    }
-
-    // The decisive check, and the one that actually catches the bug.
-    //
-    // An arena smaller than its window is permanently asking for bricks it does
-    // not have, so a correct client keeps the server streaming continuously:
-    // every eviction is a fresh request. Measured, the stream sustains nearly
-    // `uploadsPerFrame` every frame -- about 2,900 uploads over 1,500 frames.
-    //
-    // Break the retraction and the server stops: it still believes every
-    // eviction was delivered, so it sends nothing more, and the stream goes
-    // idle after the initial fill. That is not a subtle degradation -- it is
-    // ~12x fewer uploads and terrain that never comes back. So the assertion is
-    // that the stream stayed busy, which is what "evicted bricks are re-requested"
-    // looks like from outside.
-    const std::uint64_t possibleUploads = frames * kUploadsPerFrame;
-    if (uploads * 2 < possibleUploads) {
-        std::printf("FAIL: stream went idle. %llu uploads where up to %llu were "
-                    "possible -- evicted bricks are not being re-requested, so "
-                    "they will never come back\n",
-                    static_cast<unsigned long long>(uploads),
-                    static_cast<unsigned long long>(possibleUploads));
         return 1;
     }
 

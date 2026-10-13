@@ -42,54 +42,58 @@ void sleepMs(int ms) {
 // Stands in for the renderer: what actually arrives on the wire, measured
 // rather than asserted, then drained so the queue does not fill.
 struct WireTally {
-    std::uint64_t nodes = 0;
+    std::uint64_t bytes = 0;
     std::uint64_t bricks = 0;
-    std::uint64_t coarseNodes = 0;   // nodes in bricks that arrived reduced
+    std::uint64_t coarseBytes = 0;   // bytes in bricks that arrived reduced
     std::uint64_t coarseBricks = 0;
-    std::uint64_t fullNodes = 0;     // nodes in bricks at full resolution
+    std::uint64_t fullBytes = 0;     // bytes in bricks at full resolution
     std::uint64_t fullBricks = 0;
     int lowestLevel = 99;
     int highestLevel = -1;
 
-    // Total bytes the server had to serialise for these bricks.
-    std::uint64_t bytes() const { return nodes * sizeof(SvoNode); }
-
     void add(const BrickUpdate& update) {
-        const std::size_t count = update.nodes.size();
-        nodes += count;
+        // What the bandwidth actually is: an octree costs 8 bytes a node and
+        // an averaged grid costs 4 bytes a cell, and a brick carries exactly
+        // one of the two. Counting nodes alone would price every coarse brick
+        // at zero and make reduction look free instead of cheap.
+        const std::uint64_t cost =
+            static_cast<std::uint64_t>(update.nodes.size()) *
+                sizeof(SvoNode) +
+            static_cast<std::uint64_t>(update.cells.size()) * sizeof(AvgCell);
+        bytes += cost;
         const int level = static_cast<int>(update.lodLevel);
-        if (update.lodLevel >= brickLodLevel(128)) {
+        // Level 0 is the exact octree -- full resolution. Anything above it is
+        // an averaged grid. (The old split compared against the brick root
+        // level, which was the reduced-octee numbering where 7 meant full;
+        // under the pyramid numbering that test would file every full brick as
+        // coarse and every 1-cell grid as full.)
+        if (update.lodLevel == 0) {
             ++fullBricks;
-            fullNodes += count;
+            fullBytes += cost;
         } else {
             ++coarseBricks;
-            coarseNodes += count;
+            coarseBytes += cost;
         }
         lowestLevel = std::min(lowestLevel, level);
         highestLevel = std::max(highestLevel, level);
     }
 
     void report(const char* label) {
-        std::printf("%s: %llu bricks, %llu nodes (%.1f KB)\n", label,
+        std::printf("%s: %llu bricks, %.1f KB\n", label,
                     (unsigned long long)bricks,
-                    (unsigned long long)nodes,
-                    static_cast<double>(bytes()) / 1024.0);
-        // Nodes per brick is the number that matters: it is the cost of one
+                    static_cast<double>(bytes) / 1024.0);
+        // Bytes per brick is the number that matters: it is the cost of one
         // delivery. Comparing brick *counts* between the two bands is noise,
         // because the reduced band covers far more ground.
-        std::printf("  full resolution : %llu bricks, %llu nodes, "
-                    "%.0f nodes/brick\n",
+        std::printf("  full resolution : %llu bricks, %.0f bytes/brick\n",
                     (unsigned long long)fullBricks,
-                    (unsigned long long)fullNodes,
                     fullBricks == 0 ? 0.0
-                                    : static_cast<double>(fullNodes) /
+                                    : static_cast<double>(fullBytes) /
                                           static_cast<double>(fullBricks));
-        std::printf("  reduced         : %llu bricks, %llu nodes, "
-                    "%.0f nodes/brick\n",
+        std::printf("  reduced         : %llu bricks, %.0f bytes/brick\n",
                     (unsigned long long)coarseBricks,
-                    (unsigned long long)coarseNodes,
                     coarseBricks == 0 ? 0.0
-                                      : static_cast<double>(coarseNodes) /
+                                      : static_cast<double>(coarseBytes) /
                                             static_cast<double>(coarseBricks));
         std::printf("  levels seen     : %d .. %d\n", lowestLevel,
                     highestLevel);
@@ -146,12 +150,16 @@ int main() {
 
     // --- end to end: the wire -------------------------------------------------
     //
-    // Walk the player out across the world and tally what arrives. If the rings
-    // work, most of the window will be reduced and the node count will be a
-    // fraction of what full detail would cost.
+    // A stationary client, no walking. The interest window itself spans rings
+    // 0..6, which is every band the mapping defines, so walking the player
+    // across the world measures nothing the window does not already contain --
+    // the old walk cost 1500 frames and a hill to climb over for no additional
+    // signal. What is tallied is bytes per brick per band, because that is the
+    // bandwidth, and a level-4 grid of a 128-cell brick is 2 KB next to a
+    // ~40 KB full octree for the same ground.
     {
         const std::uint16_t port = 28981;
-        const WorldSpec spec{8192, 8192, 256, 128};
+        const WorldSpec spec{1024, 1024, 256, 128};
         Server server(port, spec, 0xC0FFEE);
         server.start();
         if (!server.running()) {
@@ -167,42 +175,27 @@ int main() {
             server.stop();
             return 1;
         }
-        // The authority replicates over UDP, separately from the descriptor:
-        // until the first snapshot lands, its position is zeroed.
-        for (int i = 0; i < 400; ++i) {
-            client.updateRender(1.0f / 60.0f);
-            if (client.authoritativeState().localPlayer.position !=
-                glm::vec3(0.0f))
-                break;
-            sleepMs(10);
-        }
 
         WireTally tally;
-        std::uint32_t tick = 1;
-        for (int frame = 0; frame < 1500; ++frame) {
-            InputIntent intent{};
-            intent.clientTick = ++tick;
-            intent.flying = true;
-            // Climb clear of terrain, then travel horizontally: a hillside is a
-            // legitimate obstacle to a walker but an obstacle to this test.
-            intent.jumpPressed =
-                client.authoritativeState().localPlayer.position.z < 240.0f;
-            intent.rawMove.axes = {0.0f, 1.0f};
-            client.submit(intent, 1.0f / 60.0f);
+        // 128 bricks in the world, 16 per server pass: 40 frames is ample, and
+        // the loop stops early once every brick has been seen, so the common
+        // case finishes in about a second rather than pacing out the budget.
+        std::uint32_t seenRoots = 0;
+        const std::uint32_t wantRoots = spec.rootCount();
+        for (int frame = 0; frame < 400 && seenRoots < wantRoots; ++frame) {
             client.updateRender(1.0f / 60.0f);
-
-            // Measure, then drain as the renderer would.
             std::vector<BrickUpdate> offered;
-            offered.swap(client.renderState().bricks);
+            client.drainBricks(offered);
             for (const BrickUpdate& update : offered) {
                 if (update.remove) continue;
                 tally.add(update);
                 ++tally.bricks;
-                client.renderState().uploadedRoots.push_back(update.rootIndex);
-                client.renderState().processedRoots.push_back(update.rootIndex);
+                ++seenRoots;
+                client.renderState().uploadedRefs.push_back({update.rootIndex, update.lodLevel});
+                client.renderState().processedRefs.push_back({update.rootIndex, update.lodLevel});
             }
             client.confirmUploads();
-            sleepMs(3);
+            sleepMs(2);
         }
 
         tally.report("wire");
@@ -210,40 +203,27 @@ int main() {
         server.stop();
 
         // The property that matters. Without the ring mapping the client would
-        // have received every brick at full resolution, which is several times
-        // more nodes for the same window -- and the level range would show it.
-        CHECK(tally.bricks > 20);
-        CHECK(tally.lowestLevel < full);
-        CHECK(tally.highestLevel == full);
+        // have received every brick at full resolution, and the level range
+        // would show it: lowest == highest == 0.
+        CHECK(tally.bricks >= wantRoots);
+        CHECK(tally.lowestLevel == 0);
+        CHECK(tally.highestLevel > 0);
+        CHECK(tally.fullBricks > 0);
         CHECK(tally.coarseBricks > 0);
-        // Total node counts are the wrong comparison here: the reduced band
-        // covers far more bricks than the full-resolution band does, so it can
-        // hold more nodes in total while still being far cheaper per brick.
-        // Per brick is the metric that matters, so that is what is checked.
+        // Per brick is the metric that matters, so that is what is checked: a
+        // coarse brick must cost a fraction of a full one. The bar is 2x, which
+        // is generous -- measured it is an order of magnitude -- because what
+        // is being checked is that distant bricks are genuinely cheaper, not
+        // the exact ratio for this seed.
         const double fullPerBrick =
-            static_cast<double>(tally.fullNodes) /
+            static_cast<double>(tally.fullBytes) /
             static_cast<double>(tally.fullBricks);
         const double coarsePerBrick =
-            static_cast<double>(tally.coarseNodes) /
+            static_cast<double>(tally.coarseBytes) /
             static_cast<double>(tally.coarseBricks);
-        // Reduction is real but bounded, and the bound is a property of the
-        // reduction rule rather than of the bands. Measured across every leaf
-        // level on the default world, reduction bottoms out around 2.65x no
-        // matter how coarse the request, because the conservative rule will not
-        // summarise a box the surface runs through -- it keeps the structure
-        // instead. So the ceiling is roughly 2.65x, and a band mix that is
-        // mostly coarse scenery sits below it.
-        //
-        // The lower bar than the original "4x" is honest about that: what is
-        // being checked is that distant bricks are genuinely cheaper, not that
-        // they are free. Raising it back would mean either reintroducing the
-        // any-solid-child collapse (the "large stone cubes" bug) or asserting
-        // a number the reduction rule cannot deliver.
-        CHECK(coarsePerBrick * 3 < fullPerBrick * 2);   // >= ~1.33x
-        // And the whole window must cost less than it would have unreduded.
-        std::printf("  window: %llu nodes with LOD, %.1f MB\n",
-                    (unsigned long long)tally.nodes,
-                    static_cast<double>(tally.nodes) * 8.0 / (1024.0 * 1024.0));
+        CHECK(coarsePerBrick * 2 < fullPerBrick);
+        std::printf("  window: %.1f KB with LOD\n",
+                    static_cast<double>(tally.bytes) / 1024.0);
     }
 
     if (failures == 0) std::printf("LOD ring tests passed\n");

@@ -34,19 +34,35 @@ int main(int argc, char** argv) {
     // and finding out from the allocator gives you nothing to act on.
     {
         const std::uint64_t bytesPerNode = sizeof(voxel::SvoNode);
-        // The world's node count is not known until it is generated, but the
-        // bound is: every cell could be a leaf. Reported as a bound, not an
-        // estimate, so it is never wrong in the optimistic direction.
+        // The root layer is the only part that exists up front: one pointer per
+        // root entry, with bricks materialised on demand. At the production
+        // size that is 16,777,216 pointers, and it is the entire fixed cost of
+        // holding the world.
+        const std::uint64_t indexBytes =
+            static_cast<std::uint64_t>(config.world.rootCount()) *
+            sizeof(std::unique_ptr<voxel::Brick>);
+        // What the whole world would cost if it were all resident, which is the
+        // number that used to be reported. It is no longer a bound the server
+        // respects -- the terrain is a pure function of the seed, so a brick the
+        // server has never been asked for does not need to exist, and it is
+        // regenerated on demand instead. Printing it as "worst case" was
+        // actively misleading: it read as a budget the server would approach,
+        // when the design is that it never approaches it at all.
         const std::uint64_t cells =
             static_cast<std::uint64_t>(config.world.sizeX) * config.world.sizeY *
             config.world.sizeZ;
-        const std::uint64_t bound = cells * bytesPerNode;
-        std::cout << "Server world budget: " << (config.serverWorldBytes >> 30)
-                  << " GiB (worst case for this world is "
-                  << (bound >> 30) << " GiB)\n";
-        if (bound > config.serverWorldBytes)
-            std::cout << "  warning: the world cannot exceed the budget; "
-                         "bricks will be generated lazily\n";
+        const std::uint64_t allResident = cells * bytesPerNode;
+
+        std::cout << "Server world budget: " << (config.serverWorldBytes >> 20)
+                  << " MiB\n";
+        std::cout << "  root index:      " << (indexBytes >> 20)
+                  << " MiB (fixed, " << config.world.rootCount()
+                  << " entries)\n";
+        std::cout << "  whole world resident would be "
+                  << (allResident >> 30) << " GiB; not stored, generated on "
+                     "demand from the seed\n";
+        if (indexBytes > config.serverWorldBytes)
+            std::cout << "  warning: even the root index exceeds the budget\n";
     }
 
     voxel::net::Client client(voxel::net::Peer{config.serverHost, config.serverPort});
@@ -56,6 +72,38 @@ int main(int argc, char** argv) {
     Window window("Voxel Renderer", 960, 600);
     VulkanContext renderer(&window, config.poolNodes);
     renderer.setRayParameters(config.maxRayDistance, {-0.55f, -0.35f, 0.75f});
+
+    // The streaming window is *not* the view distance, and making it one turns
+    // the screen purple.
+    //
+    // The renderer paints a brick as missing data when it is inside the window
+    // but not resident. That is only meaningful if the window is small enough to
+    // fill: the server streams roughly 4,600 bricks a second, so a radius-r
+    // window holds (2r+1)^3 bricks and takes (2r+1)^3 / 4600 seconds to arrive.
+    // Radius 16 is about eight seconds, which is a visible but short wait. At
+    // the radius 255 that a 131,072-cell view distance implies, the window is
+    // 133 million bricks and would take eight hours -- so nothing is ever
+    // resident and the entire screen is missing data, forever.
+    //
+    // Covering a world-sized view distance therefore cannot be done with a
+    // window at brick granularity. It needs the coarse pyramid levels streamed
+    // for the whole world outside the window, which is the piece not built yet.
+    {
+        constexpr std::uint32_t kMaxRadius = 16;
+        constexpr std::uint32_t kBricksPerSecond = 4600;
+        const std::uint32_t radius = std::min(kMaxRadius, 255u);
+        const std::uint64_t bricks =
+            static_cast<std::uint64_t>(2 * radius + 1) * (2 * radius + 1) *
+            (2 * radius + 1);
+        client.setInterestRadius(static_cast<std::uint8_t>(radius));
+        std::cout << "View distance " << config.maxRayDistance
+                  << " cells; streaming window radius " << radius << " bricks ("
+                  << radius * config.world.brick << " cells, " << bricks
+                  << " bricks, ~" << (bricks / kBricksPerSecond + 1)
+                  << "s to fill)\n"
+                  << "  beyond the window the background fill streams top-level "
+                     "grids, so the far field draws averaged terrain, not sky\n";
+    }
 
     bool mouseLookActive = true;
     SDL_SetWindowRelativeMouseMode(window.handle(), mouseLookActive);
@@ -132,6 +180,13 @@ int main(int argc, char** argv) {
         client.submit(intent, deltaTime);
         client.updateRender(deltaTime);
         voxel::RenderState& renderState = client.renderState();
+        // Hand over the bricks received since the last frame before drawing.
+        // The world stream runs on its own thread and was previously appending
+        // straight into `renderState.bricks`, which the renderer then iterated
+        // and cleared on this thread -- two threads mutating one vector, which
+        // is what produced "malloc: pointer being freed was not allocated" the
+        // moment a brick arrived mid-draw.
+        client.drainBricks(renderState.bricks);
         renderer.drawFrame(deltaTime, totalTime, renderState);
         // Acknowledge only what the renderer managed to place in the GPU
         // pool. Doing this before the draw, or on receipt, is what let the

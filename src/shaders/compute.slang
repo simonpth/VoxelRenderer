@@ -3,21 +3,26 @@
 // Bindings:
 //   0  storage image  compute output
 //   1  sampled image  the same image, read by the blit
-//   2  root table     one uint2 per root-layer brick (the brick root node)
+//   2  root table     one uint4 per root-layer brick (octree root + grid directory)
 //   3  node pool      every streamed node of every resident brick
 //   4  material table uint2 per material id
+//   5  grid pool      flat packed averaged cells for resident pyramid levels
 //
 // The traversal never trusts a CPU-supplied index: every pool load is bounds
 // checked, the stack is a fixed size, and the iteration count is capped, so
-// malformed data cannot hang the GPU.
+// malformed data cannot hang the GPU. Grid offsets are in-bounds by
+// construction (see gridLevelOffset): every edge in the table was validated
+// against its cell count before upload, so the sums always land inside the
+// brick's own run.
 
 #include "svo.slang"
 
 [[vk::binding(0, 0)]] RWTexture2D<float4> pixelOutput;
 [[vk::binding(1, 0)]] Texture2D<float4> sampledOutput;
-[[vk::binding(2, 0)]] StructuredBuffer<uint2> rootTable;
+[[vk::binding(2, 0)]] StructuredBuffer<uint4> rootTable;
 [[vk::binding(3, 0)]] StructuredBuffer<uint2> nodePool;
 [[vk::binding(4, 0)]] StructuredBuffer<uint2> materialTable;
+[[vk::binding(5, 0)]] StructuredBuffer<uint> gridPool;
 
 struct PushConstants {
     uint width;
@@ -39,6 +44,11 @@ struct PushConstants {
     float tanHalfFovX;
     float tanHalfFovY;
     float4 sunDirection;
+    // Interest window, in brick coordinates. See expectedByClient().
+    uint interestX;
+    uint interestY;
+    uint interestZ;
+    uint interestRadius;
 };
 
 [[vk::push_constant]] PushConstants pc;
@@ -151,11 +161,112 @@ bool traverseBrick(float3 origin, float3 inverseDirection, float3 dir,
     return found;
 }
 
+// Samples one averaged grid between `tStart` and `tLimit` with a 3D DDA at
+// the level's cell size. Empty cells are air and the ray walks through them --
+// there is no alpha, so nothing blends and nothing sorts. With `anyHit` the
+// first solid cell wins (a shadow ray's whole question); otherwise the nearest
+// hit is returned, mirroring traverseBrick's contract so the caller dispatches
+// without caring which representation answered.
+//
+// Bounded by construction: a level edge is at most 128, so the walk crosses
+// at most 3*edge cell boundaries before leaving the brick, and the cap below
+// is past that for every level.
+bool traverseGrid(float3 origin, float3 inverseDirection, float3 dir,
+                  uint4 rootEntry, uint level, float3 brickLo, float brickEdge,
+                  float tStart, float tLimit, bool anyHit,
+                  out float hitDistance, out float3 hitNormal,
+                  out float3 hitColor) {
+    hitDistance = 0.0f;
+    hitNormal = float3(0.0f, 0.0f, 1.0f);
+    hitColor = float3(0.0f, 0.0f, 0.0f);
+
+    const uint edgeLog = gridEdgeLog(rootEntry, level);
+    const float cell = (float)(1u << edgeLog);
+    const uint edge = 1u << edgeLog;
+    const uint base = gridLevelOffset(rootEntry, level);
+
+    // Grid index of the entry point, clamped: tStart is already inside the
+    // brick, so clamping only absorbs float error at the far wall.
+    const float3 rel = (origin + dir * tStart - brickLo) / cell;
+    int3 g = int3((int)floor(rel.x), (int)floor(rel.y), (int)floor(rel.z));
+    g = int3(clamp(g.x, 0, (int)edge - 1), clamp(g.y, 0, (int)edge - 1),
+             clamp(g.z, 0, (int)edge - 1));
+
+    const int3 step = int3(dir.x < 0.0f ? -1 : 1, dir.y < 0.0f ? -1 : 1,
+                           dir.z < 0.0f ? -1 : 1);
+    // Distance along the ray to the next boundary per axis, from the entry.
+    // The +1/0 per axis picks the max or min wall of the current cell.
+    const float3 wall =
+        brickLo + cell * (float3(g) + float3(max(step, int3(0, 0, 0))));
+    float3 tMax = (wall - origin) * inverseDirection;
+    const float3 tDelta = abs(cell * inverseDirection);
+
+    float t = tStart;
+    int axis = -1;
+    for (int i = 0; i < 388; ++i) {
+        const uint packed =
+            gridPool[base + (uint)(g.x + (int)edge * (g.y + (int)edge * g.z))];
+        if (gridCellSolid(packed)) {
+            hitDistance = t;
+            hitColor = gridCellColor(packed);
+            hitNormal = axis < 0 ? boxNormal(origin, dir, brickLo, brickEdge, t)
+                                 : -float3((float)(axis == 0 ? step.x : 0),
+                                           (float)(axis == 1 ? step.y : 0),
+                                           (float)(axis == 2 ? step.z : 0));
+            return true;
+        }
+        // Advance past the nearest wall. Ties step x first; any consistent
+        // order resolves the same cells, and a tie is a shared edge either way.
+        if (tMax.x <= tMax.y && tMax.x <= tMax.z) {
+            axis = 0;
+            g.x += step.x;
+            t = tMax.x;
+            tMax.x += tDelta.x;
+        } else if (tMax.y <= tMax.z) {
+            axis = 1;
+            g.y += step.y;
+            t = tMax.y;
+            tMax.y += tDelta.y;
+        } else {
+            axis = 2;
+            g.z += step.z;
+            t = tMax.z;
+            tMax.z += tDelta.z;
+        }
+        if (t > tLimit) return false;
+        if (g.x < 0 || g.y < 0 || g.z < 0 || g.x >= (int)edge ||
+            g.y >= (int)edge || g.z >= (int)edge)
+            return false;
+    }
+    return false;
+}
+
 float4 unpackRgba8(uint packed) {
     return float4((float)((packed >> 24) & 0xFFu) / 255.0f,
                   (float)((packed >> 16) & 0xFFu) / 255.0f,
                   (float)((packed >> 8) & 0xFFu) / 255.0f,
                   (float)(packed & 0xFFu) / 255.0f);
+}
+
+// Did the client ever promise to hold this brick?
+//
+// This is the distinction the whole "missing brick" rendering hangs on. The
+// client runs a bounded arena on a world far larger than it, so the great
+// majority of the root layer is not resident and never will be. Reporting
+// *every* non-resident brick as missing is what filled the sky with purple
+// cubes: on a 128-brick world a missing brick was a real gap, but on a
+// 16,777,216-brick one every ray into open sky left the window almost
+// immediately and hit a brick the client had never been asked for.
+//
+// So "missing" has to mean "inside the window and not delivered yet" -- a hole
+// that is filling in. Outside the window the client makes no promise, and a
+// brick it does not hold is simply empty space as far as it can tell.
+bool expectedByClient(int3 brickCell) {
+    const int radius = (int)pc.interestRadius;
+    if (radius <= 0) return false;
+    const int3 centre = int3((int)pc.interestX, (int)pc.interestY,
+                             (int)pc.interestZ);
+    return all(abs(brickCell - centre) <= int3(radius, radius, radius));
 }
 
 // Walks the root layer along a ray, brick by brick.
@@ -167,7 +278,7 @@ float4 unpackRgba8(uint packed) {
 // coordinate, which always lands in a genuinely different voxel.
 bool walkBricks(float3 origin, float3 dir, float rayLimit, bool anyHit,
                 out float hitDistance, out float3 hitNormal,
-                out uint hitMaterial) {
+                out uint hitMaterial, out float3 hitColor) {
     // Cleared up front, because not every early return sets them: a caller
     // that inspects the outputs after a false result -- raycast does, to tell
     // "hit air" from "ran out of data" -- would otherwise read uninitialised
@@ -175,6 +286,7 @@ bool walkBricks(float3 origin, float3 dir, float rayLimit, bool anyHit,
     hitDistance = 0.0f;
     hitNormal = float3(0.0f, 0.0f, 1.0f);
     hitMaterial = 0u;
+    hitColor = float3(0.0f, 0.0f, 0.0f);
 
     const float3 inverseDirection = safeInverse(dir);
     const float3 worldLo = float3(0.0f, 0.0f, 0.0f);
@@ -202,16 +314,28 @@ bool walkBricks(float3 origin, float3 dir, float rayLimit, bool anyHit,
                            dir.z < 0.0f ? -1 : 1);
 
     float distance = tNear;
-    for (int iteration = 0; iteration < 512; ++iteration) {
+    // Bounded so malformed data cannot hang the GPU, but high enough to cross
+    // the world. A ray travelling the full 65536-cell width steps through 512
+    // bricks, and a diagonal one through more than that, so the old cap of 512
+    // stopped rays at roughly half a world and they ended in open sky no matter
+    // what was there.
+    for (int iteration = 0; iteration < 2048; ++iteration) {
         const int3 brickCell =
             int3(cell.x / brick, cell.y / brick, cell.z / brick);
         const uint rootIndex =
             (uint)(brickCell.x + dimX * (brickCell.y + dimY * brickCell.z));
         if (rootIndex >= (uint)(dimX * dimY * dimZ)) return false;
-        const uint2 rootPacked = rootTable[rootIndex];
-        // Unknown data is never silently treated as empty space: the caller
-        // renders it as missing rather than as air.
-        if (((rootPacked.x >> 24) & kSvoFlagResident) == 0u) {
+        const uint4 rootPacked = rootTable[rootIndex];
+        const bool resident = ((rootPacked.x >> 24) & kSvoFlagResident) != 0u;
+        // Usable means any resident level, not just the octree: a brick whose
+        // detail brick was evicted but whose grids stayed still renders, from
+        // the grids. Unknown data is never silently treated as empty space
+        // *where the client owes the viewer data*: inside the window a brick
+        // with nothing usable is a hole still filling in, and the caller
+        // renders it as missing. Outside it, the client was never asked, so
+        // the ray passes through.
+        const bool usable = resident || (gridLevelMask(rootPacked) & 0xFEu) != 0u;
+        if (!usable && expectedByClient(brickCell)) {
             hitMaterial = kUnknownMaterial;
             return false;
         }
@@ -223,13 +347,44 @@ bool walkBricks(float3 origin, float3 dir, float rayLimit, bool anyHit,
         const bool overlaps =
             intersectBox(origin, inverseDirection, brickLo,
                          brickLo + brickEdge, brickNear, brickFar);
-        if (overlaps) {
+        // The box is still intersected geometrically when the brick is not
+        // resident, so an unheld brick is stepped over in one move rather than
+        // a cell at a time. That keeps a sky ray crossing hundreds of empty
+        // bricks inside the iteration cap instead of exhausting it.
+        if (overlaps && usable) {
             const float entry = max(distance, brickNear);
-            if (traverseBrick(origin, inverseDirection, dir, rootPacked,
-                              brickLo, brickEdge, entry,
-                              min(brickFar, tFar), anyHit, hitDistance,
-                              hitNormal, hitMaterial))
-                return true;
+            const float limit = min(brickFar, tFar);
+            // Usable guarantees an answer: either the mask is non-zero and
+            // selection picks among resident levels, or only the octree is
+            // resident and selection falls through to level 0. Level 0 is the
+            // exact octree; anything above is an averaged grid at this brick's
+            // own scale.
+            const uint level =
+                selectGridLevel(rootPacked, desiredGridLevel(entry, (uint)brick));
+            if (level == 0u) {
+                if (traverseBrick(origin, inverseDirection, dir,
+                                  rootPacked.xy, brickLo, brickEdge, entry,
+                                  limit, anyHit, hitDistance, hitNormal,
+                                  hitMaterial))
+                    return true;
+            } else {
+                float gridDist;
+                float3 gridNormal;
+                float3 gridColor;
+                if (traverseGrid(origin, inverseDirection, dir, rootPacked,
+                                 level, brickLo, brickEdge, entry, limit,
+                                 anyHit, gridDist, gridNormal, gridColor)) {
+                    // Nearest-hit walk: bricks arrive in ray order and the
+                    // grid sample is nearest within this one, so the first
+                    // brick that answers wins -- same contract as the octree.
+                    // (For anyHit the first solid cell is the whole answer.)
+                    hitDistance = gridDist;
+                    hitNormal = gridNormal;
+                    hitMaterial = kAveragedMaterial;
+                    hitColor = gridColor;
+                    return true;
+                }
+            }
         }
 
         const float nextDistance =
@@ -270,8 +425,14 @@ bool occluded(float3 origin, float3 dir) {
     float hitDistance;
     float3 hitNormal;
     uint hitMaterial;
-    const bool hit = walkBricks(origin, dir, (float)pc.maxRayDistance, true,
-                                hitDistance, hitNormal, hitMaterial);
+    // A shadow ray needs to escape the terrain, not to cross the world. Giving
+    // it the primary ray's distance means every lit surface walks hundreds of
+    // empty bricks looking for something that is not between it and the sun.
+    const float shadowDistance = min((float)pc.maxRayDistance, 8192.0f);
+    float3 shadowColor;
+    const bool hit = walkBricks(origin, dir, shadowDistance, true,
+                                hitDistance, hitNormal, hitMaterial,
+                                shadowColor);
     // `hitMaterial` is kUnknownMaterial exactly when the walk stopped because a
     // brick had not been streamed. Both cases block.
     return hit || hitMaterial == kUnknownMaterial;
@@ -282,9 +443,16 @@ bool raycast(float3 origin, float3 dir, float rayLimit, out float3 color,
              out float3 normal, out uint material) {
     float hitDistance;
     float3 hitNormal;
+    float3 hitColor;
     uint hitMaterial = 0;
+    // Set before any early return, so a caller that inspectes the outputs
+    // after a miss reads defined values rather than whatever was in the
+    // registers. The miss path returns without touching color/normal/material.
+    color = kUnknownColor;
+    normal = float3(0.0f, 0.0f, 1.0f);
+    material = kUnknownMaterial;
     if (!walkBricks(origin, dir, rayLimit, false, hitDistance, hitNormal,
-                    hitMaterial)) {
+                    hitMaterial, hitColor)) {
         if (hitMaterial != kUnknownMaterial) return false;
         // Missing brick: show it as unknown data, not as empty space.
         color = kUnknownColor;
@@ -295,6 +463,19 @@ bool raycast(float3 origin, float3 dir, float rayLimit, out float3 color,
 
     material = hitMaterial;
     normal = hitNormal;
+    if (hitMaterial == kAveragedMaterial) {
+        // A coarse hit shades from its own averaged colour: no material
+        // lookup (levels above 0 carry no material ids), no emissive branch.
+        // Same diffuse model as the octree path, so a brick reads as one
+        // surface whether the ray resolved it exact or averaged.
+        color = hitColor;
+        const float3 toSun = pc.sunDirection.xyz;
+        const float3 hitPoint = origin + dir * hitDistance + hitNormal * 1e-3f;
+        color *= occluded(hitPoint, toSun)
+                     ? 0.25f
+                     : 0.28f + 0.72f * max(dot(hitNormal, toSun), 0.0f);
+        return true;
+    }
     color = float3(0.5f, 0.5f, 0.5f);
     if (hitMaterial < pc.materialCount) {
         const uint2 entry = materialTable[hitMaterial];

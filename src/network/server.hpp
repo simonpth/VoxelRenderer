@@ -19,6 +19,17 @@
 
 namespace voxel::net {
 
+// Packs a root index and a pyramid level into one map key.
+//
+// Mirrors Client::levelKey(). Both sides have to agree on it byte for byte,
+// because it is what an ack names: the client says "this root at this level
+// arrived", and the server has to find the record it already holds for it.
+inline std::uint64_t levelKey(std::uint32_t rootIndex,
+                              std::uint8_t level) noexcept {
+    return (static_cast<std::uint64_t>(rootIndex) << 3) |
+           static_cast<std::uint64_t>(level);
+}
+
 // ---------------------------------------------------------------------------
 // Server
 //
@@ -79,6 +90,13 @@ class Server {
         // exactly wrong now: it makes every brick outside the window look
         // undelivered, so the background fill resends the world forever and the
         // client evicts what it just received to make room.
+        //
+        // Keyed on (rootIndex, level), not rootIndex, because a brick is
+        // delivered one pyramid level at a time and each is acknowledged on its
+        // own. A single key would let a level-0 delivery stand in for the
+        // coarse level of the same brick: the client would never be sent the
+        // level 5 grid once it had the octree, so the far field it needs that
+        // grid for would stay empty.
         struct Delivery {
             std::uint32_t revision = 0;
             // Monotonic milliseconds. Used only for `sent`, so a frame that
@@ -86,8 +104,8 @@ class Server {
             // treated as delivered forever.
             std::uint64_t at = 0;
         };
-        std::unordered_map<std::uint32_t, Delivery> acknowledged;
-        std::unordered_map<std::uint32_t, Delivery> sent;
+        std::unordered_map<std::uint64_t, Delivery> acknowledged;
+        std::unordered_map<std::uint64_t, Delivery> sent;
     };
 
     struct ClientConnection {

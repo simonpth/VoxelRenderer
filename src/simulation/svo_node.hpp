@@ -69,4 +69,39 @@ struct alignas(8) SvoNode {
 
 static_assert(sizeof(SvoNode) == 8);
 
+// ---------------------------------------------------------------------------
+// Averaged colour cell
+//
+// The payload of every pyramid level above 0. Also a wire and GPU layout: it
+// is sent as four bytes and read the same way on both sides.
+//
+//   byte0 r   byte1 g   byte2 b   byte3 flags (bit0: solid)
+//
+// There is no alpha, and that is the point. A cell either has a colour or it is
+// empty; nothing part-covers a cell. That makes an averaged level a sampling of
+// the volume above it rather than a lossy compression with holes in it, and it
+// means the renderer never has to blend or sort two half-transparent levels
+// against each other. See the pyramid notes in svo.hpp for how the levels are
+// derived and where the occupancy thresholds come from.
+// ---------------------------------------------------------------------------
+struct AvgCell {
+    std::uint8_t r = 0;
+    std::uint8_t g = 0;
+    std::uint8_t b = 0;
+    // Empty means "no terrain in this cell", not "transparent". A solid cell
+    // with no colour is not reachable.
+    bool empty = true;
+
+    bool solid() const { return !empty; }
+
+    bool operator==(const AvgCell& other) const {
+        if (empty != other.empty) return false;
+        // Two empty cells are equal whatever the colour bytes hold, so an
+        // empty cell can be compared without first clearing them.
+        return empty || (r == other.r && g == other.g && b == other.b);
+    }
+};
+
+static_assert(sizeof(AvgCell) == 4);
+
 } // namespace voxel

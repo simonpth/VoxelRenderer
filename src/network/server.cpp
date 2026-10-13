@@ -1,4 +1,5 @@
 #include "server.hpp"
+#include "pacer.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -22,64 +23,6 @@ constexpr std::size_t kMaxFillPerPass = 64;
 // expensive serialisation rather than after.
 constexpr std::size_t kFrameOverheadBytes = 64;
 
-// Token bucket over bytes.
-//
-// The world is streamed in full, and the point of the budget is that data keeps
-// arriving at a steady, bounded rate until there is none left -- not that the
-// server empties itself onto the socket as fast as it can encode. A bucket
-// rather than a fixed per-pass quota, because a quota tied to the loop rate
-// makes the actual bandwidth depend on how often the loop happens to iterate,
-// which is not a rate anyone can reason about.
-//
-// Refills continuously rather than in discrete ticks, so a client that pauses
-// briefly accumulates credit and catches up at full rate instead of creeping.
-class Pacer {
-  public:
-    Pacer(std::uint64_t bytesPerSecond, std::uint64_t now)
-        : m_rate(bytesPerSecond), m_last(now) {
-        // An unmetered bucket starts full, so the first frame is not delayed by
-        // a second of accrual. Starting it empty is what makes "zero means
-        // unmetered" behave as "zero means nothing is ever sent".
-        m_available = burstCap();
-    }
-
-    // True if `bytes` fit in what has accumulated since the last call. Always
-    // true when unmetered.
-    bool canSpend(std::uint64_t now, std::size_t bytes) {
-        if (m_rate == 0) return true;
-        refill(now);
-        return bytes <= m_available;
-    }
-
-    void charge(std::uint64_t now, std::size_t bytes) {
-        if (m_rate == 0) return;
-        refill(now);
-        // Saturating: a bucket that underflowed would silently grant credit
-        // that was never earned.
-        m_available = bytes >= m_available ? 0 : m_available - bytes;
-        (void)now;
-    }
-
-  private:
-    void refill(std::uint64_t now) {
-        if (now <= m_last) return;
-        const std::uint64_t elapsed = now - m_last;
-        m_last = now;
-        // A burst cap of one second's worth: without it, a long pause would
-        // bank enough credit to dump a whole world in one pass, which is the
-        // unbounded burst this exists to prevent.
-        const std::uint64_t cap = burstCap();
-        const std::uint64_t added = m_rate * elapsed / 1000;
-        m_available = (m_available + added) > cap ? cap : m_available + added;
-    }
-
-    std::uint64_t burstCap() const { return m_rate > 0 ? m_rate : ~0ull; }
-
-    std::uint64_t m_rate;
-    std::uint64_t m_last;
-    std::uint64_t m_available = 0;
-};
-
 } // namespace
 
 Server::Server(std::uint16_t port, voxel::WorldSpec spec, std::uint64_t seed,
@@ -91,6 +34,13 @@ void Server::start() {
     if (m_running.exchange(true)) return;
     // Small worlds are cheap to build, and streaming them lazily would stall a
     // tick mid-frame, so materialise the whole root layer up front.
+    //
+    // At the production size of 65536 x 65536 x 8192 the root layer is
+    // 16,777,216 bricks, so this never runs: generation is entirely lazy,
+    // which is the only way that size is reachable at all. The guard is not
+    // redundant, it is the switch between the two regimes -- and the test that
+    // would catch it being wrong is VoxelBigWorldTests, which asserts the
+    // world it runs on is above the threshold.
     if (m_world->rootCount() <= 4096) m_world->generateAll();
     m_thread = std::thread(&Server::run, this);
     m_worldThread = std::thread(&Server::worldRun, this);
@@ -380,6 +330,13 @@ void Server::worldConnection(TcpSocket connection,
         // sort key is Euclidean (nearest first) while the LOD key is Chebyshev
         // (a square neighbourhood, matching the interest window).
         std::int32_t ring;
+        // Which level of this brick's pyramid to send, derived from the ring.
+        // Decided when the target is created rather than when it is sent, so
+        // the delivery bookkeeping -- which is per (rootIndex, level) -- can
+        // tell a brick it is already streaming at the right level from one it
+        // is about to stream at the wrong one. Deriving it later would mean the
+        // record and the payload could disagree.
+        std::uint8_t level;
     };
     const int brick = static_cast<int>(m_spec.brick);
     const int dimX = static_cast<int>(m_spec.rootDimX());
@@ -407,12 +364,13 @@ void Server::worldConnection(TcpSocket connection,
             WorldAck ack{};
             if (decode(frame, ack)) {
                 std::scoped_lock lock(stream->mutex);
-                stream->acknowledged[ack.rootIndex] =
+                const auto key = levelKey(ack.rootIndex, ack.lodLevel);
+                stream->acknowledged[key] =
                     StreamClient::Delivery{ack.revision, 0};
                 // Confirmed, so it no longer needs retrying. Leaving the entry
                 // behind would be harmless (acknowledged is checked first) but
                 // it would keep the map holding bricks twice.
-                stream->sent.erase(ack.rootIndex);
+                stream->sent.erase(key);
                 serviced = true;
                 continue;
             }
@@ -427,11 +385,19 @@ void Server::worldConnection(TcpSocket connection,
                 // back in "never sent" state, so the next pass streams it
                 // again and the client re-uploads it.
                 //
+                // All levels go, not just level 0. The message carries no level
+                // on purpose: the renderer evicts a brick, not a level of one,
+                // so the honest thing is to clear the whole record and let the
+                // next pass re-offer whatever is still wanted.
+                //
                 // Forgetting a brick the client genuinely holds is harmless:
                 // it just gets resent, and the client's dedup drops the frame
                 // if the revision matches what it already has.
-                stream->acknowledged.erase(forget.rootIndex);
-                stream->sent.erase(forget.rootIndex);
+                for (std::uint8_t level = 0; level < voxel::kLodLevels; ++level) {
+                    stream->acknowledged.erase(
+                        levelKey(forget.rootIndex, level));
+                    stream->sent.erase(levelKey(forget.rootIndex, level));
+                }
                 serviced = true;
             }
         }
@@ -469,11 +435,34 @@ void Server::worldConnection(TcpSocket connection,
             const int cy = std::clamp(stream->centerY / brick, 0, dimY - 1);
             const int cz = std::clamp(stream->centerZ / brick, 0, dimZ - 1);
             const int radius = static_cast<int>(stream->radius);
-            const auto held = [&](std::uint32_t index) {
-                return stream->acknowledged.find(index) !=
+            const std::uint8_t brickRootLevel = static_cast<std::uint8_t>(
+                voxel::brickLodLevel(m_spec.brick));
+            // Held means "delivered and confirmed, at this level". A brick whose
+            // level-0 octree is resident does not thereby have its level 5
+            // grid, and the two are acked separately -- see levelKey().
+            const auto held = [&](std::uint32_t index, std::uint8_t level) {
+                const auto key = levelKey(index, level);
+                return stream->acknowledged.find(key) !=
                            stream->acknowledged.end() ||
-                       stream->sent.find(index) != stream->sent.end();
+                       stream->sent.find(key) != stream->sent.end();
             };
+            const auto shouldSkip =
+                [&](std::uint32_t index, std::uint8_t level,
+                    std::uint32_t current, std::uint64_t now) {
+                    const auto key = levelKey(index, level);
+                    const auto acked = stream->acknowledged.find(key);
+                    if (acked != stream->acknowledged.end() &&
+                        acked->second.revision == current)
+                        return true;
+                    if (acked == stream->acknowledged.end()) {
+                        const auto inFlight = stream->sent.find(key);
+                        if (inFlight != stream->sent.end() &&
+                            inFlight->second.revision == current &&
+                            now - inFlight->second.at < kResendAfterMs)
+                            return true;
+                    }
+                    return false;
+                };
 
             // Tier 0: the window, nearest first. This carries three different jobs and
             // all three matter:
@@ -499,51 +488,69 @@ void Server::worldConnection(TcpSocket connection,
                             continue;
                         const auto index = static_cast<std::uint32_t>(
                             bx + dimX * (by + dimY * bz));
+                        const std::int32_t ring =
+                            std::max({std::abs(bx - cx), std::abs(by - cy),
+                                      std::abs(bz - cz)});
+                        // lodForRing speaks the old numbering, where the brick
+                        // root level (7 for a 128-cell brick) means "full
+                        // octree". The pyramid wire speaks 0 for the octree
+                        // and 1..7 for the averaged grids, so the top maps to
+                        // 0 and everything else passes through unchanged: a
+                        // reduced tree with 16-cell leaves and a level-4 grid
+                        // of 16-cell cells are the same sampling, and keeping
+                        // the number means the ring bands keep the sizes the
+                        // renderer was tuned against.
+                        const std::uint8_t leaf = voxel::lodForRing(
+                            ring, brickRootLevel);
+                        const std::uint8_t level =
+                            leaf >= brickRootLevel ? 0 : leaf;
                         const std::uint32_t current =
                             m_world->brickRevision(index);
-                        const auto acked = stream->acknowledged.find(index);
-                        if (acked != stream->acknowledged.end() &&
-                            acked->second.revision == current)
-                            continue;
-                        if (acked == stream->acknowledged.end()) {
-                            const auto inFlight = stream->sent.find(index);
-                            if (inFlight != stream->sent.end() &&
-                                inFlight->second.revision == current &&
-                                now - inFlight->second.at < kResendAfterMs)
-                                continue;
-                        }
+                        if (shouldSkip(index, level, current, now)) continue;
                         const float dx = static_cast<float>(bx - cx);
                         const float dy = static_cast<float>(by - cy);
                         const float dz = static_cast<float>(bz - cz);
-                        priority.push_back(
-                            Target{index, dx * dx + dy * dy + dz * dz,
-                                   std::max({std::abs(bx - cx),
-                                             std::abs(by - cy),
-                                             std::abs(bz - cz)})});
+                        priority.push_back(Target{index,
+                                                  dx * dx + dy * dy + dz * dz,
+                                                  ring, level});
                     }
 
             // Tier 1: sweep the whole world from the cursor for bricks the
             // client has never been sent. The sweep is bounded per pass so a
             // large world costs a predictable amount of work per iteration, and
             // it wraps, so the fill revisits everything on its second lap.
+            //
+            // The fill sends the *top* level: one cell for the whole brick,
+            // four bytes. That is the point of the pyramid for the background
+            // -- a world of 16.7M bricks at one cell each is 67 MB, which is
+            // what makes "have the whole world resident" affordable. Anything
+            // finer than the top level for scenery the player cannot see is
+            // bandwidth spent on detail no one will look at, and it is exactly
+            // what the interest window is for.
             const std::uint32_t total = m_spec.rootCount();
+            // The top of the pyramid: one cell for the whole brick. Written as
+            // a pyramid level directly rather than derived from a ring, because
+            // the ring mapping would read "root level" as "full octree" and
+            // send 16.7M exact bricks as the background fill.
+            const std::uint8_t fillLevel = brickRootLevel;
             std::uint32_t examined = 0;
             while (examined < kFillSweepPerPass && fill.size() < kMaxFillPerPass) {
                 const std::uint32_t index = fillCursor;
                 fillCursor = (fillCursor + 1 < total) ? fillCursor + 1 : 0;
                 ++examined;
                 ++fillScanned;
-                if (held(index)) continue;
+                if (held(index, fillLevel)) continue;
                 const int bx = static_cast<int>(index % dimX);
                 const int by = static_cast<int>((index / dimX) % dimY);
                 const int bz = static_cast<int>(index / (dimX * dimY));
                 const float dx = static_cast<float>(bx - cx);
                 const float dy = static_cast<float>(by - cy);
                 const float dz = static_cast<float>(bz - cz);
-                fill.push_back(Target{
-                    index, dx * dx + dy * dy + dz * dz,
+                const std::int32_t ring =
                     std::max({std::abs(bx - cx), std::abs(by - cy),
-                              std::abs(bz - cz)})});
+                              std::abs(bz - cz)});
+                fill.push_back(Target{index, dx * dx + dy * dy + dz * dz, ring,
+                                      fillLevel});
             }
         }
         if (priority.empty() && fill.empty()) {
@@ -551,8 +558,27 @@ void Server::worldConnection(TcpSocket connection,
             if (!serviced) connection.pollReadable(20);
             continue;
         }
+        // Ordered by *ring*, not by Euclidean distance.
+        //
+        // The level of detail is a function of the ring and is monotonic in it:
+        // ring 0..2 is full resolution, and every band beyond is coarser. So
+        // sorting by ring sends every brick at full resolution before any brick
+        // at reduced detail, and the bands follow in order -- high quality
+        // first, then progressively further away and lower quality, which is
+        // what the player should be seeing arrive.
+        //
+        // Sorting by Euclidean distance instead does not achieve that. The
+        // distance shells and the LOD rings are different shapes: a brick
+        // diagonally far but on a small ring shares a band with bricks right
+        // next to the player, and gets interleaved with them. The result was
+        // that reduced-detail bricks were arriving while the ground under the
+        // player's feet was still queued.
+        //
+        // Distance breaks ties, so bricks within one band still arrive nearest
+        // first.
         std::sort(priority.begin(), priority.end(),
                   [](const Target& a, const Target& b) {
+                      if (a.ring != b.ring) return a.ring < b.ring;
                       return a.distance < b.distance;
                   });
 
@@ -575,27 +601,69 @@ void Server::worldConnection(TcpSocket connection,
             if (!pacer.canSpend(nowMs(), kFrameOverheadBytes)) break;
             voxel::SvoNode root{};
             std::vector<voxel::SvoNode> nodes;
+            std::vector<BrickLevel> levels;
             std::uint32_t revision = 0;
+            // The target carries the level that was chosen for it when it was
+            // scheduled, which is what makes the delivery record below match
+            // the payload actually sent. Deriving it here instead would let a
+            // brick be booked at one level and shipped at another.
+            const std::uint8_t leafLevel = target.level;
             const std::uint8_t brickRootLevel = static_cast<std::uint8_t>(
                 voxel::brickLodLevel(m_spec.brick));
-            // The level of detail is a function of the ring, so a distant brick
-            // is reduced *before* it is serialised rather than sent whole and
-            // reduced after. This is where the bandwidth saving happens.
-            const std::uint8_t leafLevel =
-                voxel::lodForRing(target.ring, brickRootLevel);
-            {
+            if (leafLevel == 0) {
                 std::scoped_lock worldLock(m_worldMutex);
-                if (leafLevel >= brickRootLevel) {
-                    m_world->snapshot(target.rootIndex, revision, root, nodes);
-                } else {
-                    m_world->snapshotLod(target.rootIndex, leafLevel, revision,
-                                         root, nodes);
-                }
+                m_world->snapshot(target.rootIndex, revision, root, nodes);
                 if (nodes.empty()) {
                     // A completely empty brick still needs its root entry so
                     // the client can tell "resident and empty" from "unknown".
                     root.setFlags(root.flags() | voxel::kSvoFlagResident);
                     nodes.push_back(root);
+                }
+            } else {
+                // An averaged grid, not a reduced octree.
+                //
+                // This is where the pyramid pays for itself. The old reduction
+                // walked the exact octree and had to preserve material identity,
+                // so it refused to summarise any box a surface ran through and
+                // the refusal kept the subtree. Averaging has no refusal case:
+                // every box collapses to one colour, so a level-k grid is
+                // exactly (brick >> k)^3 cells whatever the terrain does. Level
+                // 5 of a 128-cell brick is 64 cells on the wire, where the same
+                // volume as a reduced octree is routinely tens of kilobytes.
+                std::scoped_lock worldLock(m_worldMutex);
+                voxel::BrickPyramid pyramid{};
+                m_world->snapshotPyramid(target.rootIndex, pyramid);
+                revision = pyramid.revision;
+                const std::vector<AvgCell>& cells = pyramid.level[leafLevel];
+                if (!cells.empty()) {
+                    BrickLevel level{};
+                    level.level = leafLevel;
+                    level.edge = 1u << (brickRootLevel - leafLevel);
+                    level.cells = cells;
+                    levels.push_back(std::move(level));
+                } else if (pyramid.uniform) {
+                    // A uniform brick holds one cell, and it is the value of
+                    // every level it has. Broadcast it with the single-colour
+                    // fast path rather than fanning it out to edge^3 identical
+                    // bytes: level 1 of a 128-cell brick would otherwise be a
+                    // megabyte of one colour, and 96% of the world is exactly
+                    // this case.
+                    BrickLevel level{};
+                    level.level = leafLevel;
+                    level.edge = 0;
+                    if (!pyramid.level[brickRootLevel].empty())
+                        level.cells.assign(
+                            1, pyramid.level[brickRootLevel].front());
+                    else
+                        level.cells.assign(1, pyramid.uniformCell);
+                    levels.push_back(std::move(level));
+                }
+                if (levels.empty()) {
+                    // Nowhere to put the data. Skipping rather than sending an
+                    // empty frame, which the client would reject: the resend
+                    // cost is one retry, the alternative is a brick that looks
+                    // corrupt forever.
+                    continue;
                 }
             }
             BrickSnapshot snapshot{};
@@ -606,6 +674,7 @@ void Server::worldConnection(TcpSocket connection,
             snapshot.worldRevision = m_world->revision();
             snapshot.lodLevel = leafLevel;
             snapshot.nodes = std::move(nodes);
+            snapshot.levels = std::move(levels);
             const auto frame = encode(snapshot);
             if (frame.empty()) continue;   // payload too large to encode
             // Charged by actual size rather than an estimate, so the rate is
@@ -618,7 +687,12 @@ void Server::worldConnection(TcpSocket connection,
             pacer.charge(nowMs(), frame.size());
             windowBytes += frame.size();
             std::scoped_lock lock(stream->mutex);
-            stream->sent[target.rootIndex] =
+            // Recorded against the level actually sent. The client
+            // acknowledges the same key, and a mismatch here would book a level
+            // the client never received -- the brick would be skipped forever
+            // as already-delivered while the client waits for a frame that is
+            // never coming.
+            stream->sent[levelKey(target.rootIndex, leafLevel)] =
                 StreamClient::Delivery{revision, nowMs()};
             ++sent;
         }

@@ -50,18 +50,65 @@ float noiseAt(std::uint32_t x, std::uint32_t y, std::uint32_t cell,
 }
 
 // Surface height of one world column: three octaves of value noise.
+//
+// The constants below are in *reference world* cells (1024 x 1024 x 256);
+// terrainShape() scales them for the world actually loaded. See TerrainShape.
 constexpr std::uint32_t kTerrainSeed = 0x5EED1234u;
 constexpr float kTerrainBase = 46.0f;
+constexpr std::uint32_t kRefSizeX = 1024;
+constexpr std::uint32_t kRefSizeZ = 256;
+
 // Bumped when a change here would make the same seed produce a different
 // world. Saved regions record it and refuse to load on a mismatch.
-constexpr std::uint32_t kGeneratorVersion = 2;
+constexpr std::uint32_t kGeneratorVersion = 3;
 
-float terrainHeight(std::int32_t x, std::int32_t y) {
+} // namespace
+
+// noiseAt masks its coordinate with (cell - 1) and divides by cell, so `cell`
+// has to be a power of two. Scaling a cell size by a non-power-of-two world
+// therefore cannot land exactly, and rounding is the only option; rounding up
+// keeps the landforms from becoming finer than intended.
+std::uint32_t scaleCell(std::uint32_t base, float factor) {
+    const float want = static_cast<float>(base) * factor;
+    std::uint32_t cell = 1;
+    while (static_cast<float>(cell) < want && cell < (1u << 24)) cell <<= 1;
+    return cell;
+}
+
+TerrainShape terrainShape(std::uint32_t sizeX, std::uint32_t sizeZ) {
+    // Clamped at 1: a world smaller than the reference keeps the reference
+    // landform unchanged rather than having it scaled down out from under any
+    // code that was written against it.
+    const float lateral = std::max(1.0f, static_cast<float>(sizeX) /
+                                               static_cast<float>(kRefSizeX));
+    const float vertical = std::max(1.0f, static_cast<float>(sizeZ) /
+                                               static_cast<float>(kRefSizeZ));
+    const auto scaled = [&](std::uint32_t base) {
+        return std::max(1u, static_cast<std::uint32_t>(
+                                static_cast<float>(base) * vertical + 0.5f));
+    };
+    TerrainShape shape;
+    shape.cell0 = scaleCell(256u, lateral);
+    shape.cell1 = scaleCell(64u, lateral);
+    shape.cell2 = scaleCell(16u, lateral);
+    shape.base = kTerrainBase * vertical;
+    shape.amp0 = 26.0f * vertical;
+    shape.amp1 = 9.0f * vertical;
+    shape.amp2 = 3.0f * vertical;
+    shape.dirtBand = scaled(5u);
+    shape.lavaBand = scaled(2u);
+    shape.sandLine = scaled(54u);
+    return shape;
+}
+
+namespace {
+
+float terrainHeight(std::int32_t x, std::int32_t y, const TerrainShape& shape) {
     const auto ux = static_cast<std::uint32_t>(x < 0 ? 0 : x);
     const auto uy = static_cast<std::uint32_t>(y < 0 ? 0 : y);
-    return kTerrainBase + noiseAt(ux, uy, 256u, kTerrainSeed) * 26.0f +
-           noiseAt(ux, uy, 64u, kTerrainSeed + 1u) * 9.0f +
-           noiseAt(ux, uy, 16u, kTerrainSeed + 2u) * 3.0f;
+    return shape.base + noiseAt(ux, uy, shape.cell0, kTerrainSeed) * shape.amp0 +
+           noiseAt(ux, uy, shape.cell1, kTerrainSeed + 1u) * shape.amp1 +
+           noiseAt(ux, uy, shape.cell2, kTerrainSeed + 2u) * shape.amp2;
 }
 
 // Material ids, kept in sync with serverMaterials().
@@ -71,13 +118,12 @@ constexpr std::uint16_t kGrassId = 3;
 constexpr std::uint16_t kSandId = 4;
 constexpr std::uint16_t kLavaId = 5;
 
-// Stratification, in cells measured from the column top. These are *world*
-// z bands: terrainMaterial applies them to the world coordinate, so the
-// generator has to compare against a world z too. Applying them to a
-// brick-local z makes every brick above z=0 repeat the lava and dirt bands
-// at its own floor, which is how a 32-tall world ends up with lava at z=16.
-constexpr std::uint32_t kLavaBand = 2;   // world z < kLavaBand is always lava
-constexpr std::uint32_t kDirtBand = 5;   // [top-kDirtBand, top-2) is dirt
+// Stratification reference values, scaled per world by terrainShape() into
+// TerrainShape::dirtBand / lavaBand / sandLine. These are *world* z bands:
+// terrainMaterial applies them to the world coordinate, so the generator has to
+// compare against a world z too. Applying them to a brick-local z makes every
+// brick above z=0 repeat the lava and dirt bands at its own floor, which is how
+// a 32-tall world ends up with lava at z=16.
 
 } // namespace
 
@@ -85,6 +131,27 @@ std::uint32_t brickLodLevel(std::uint32_t brick) {
     std::uint32_t level = 0;
     while ((1u << (level + 1)) <= brick) ++level;
     return level;
+}
+
+std::uint32_t terrainTop(std::int32_t x, std::int32_t y, std::int32_t maxZ,
+                         const TerrainShape& shape) {
+    std::int32_t top =
+        static_cast<std::int32_t>(std::floor(terrainHeight(x, y, shape))) + 1;
+    top = std::clamp(top, 1, std::max(1, maxZ));
+    return static_cast<std::uint32_t>(top);
+}
+
+std::uint16_t terrainMaterial(std::int32_t x, std::int32_t y, std::int32_t z,
+                             std::uint32_t top, const TerrainShape& shape) {
+    (void)x;
+    (void)y;
+    const auto zi = static_cast<std::int32_t>(z);
+    const auto ti = static_cast<std::int32_t>(top);
+    if (zi >= ti) return 0;
+    if (zi < static_cast<std::int32_t>(shape.lavaBand)) return kLavaId;
+    if (zi == ti - 1) return top < shape.sandLine ? kSandId : kGrassId;
+    if (zi + static_cast<std::int32_t>(shape.dirtBand) >= ti) return kDirtId;
+    return kStoneId;
 }
 
 std::uint32_t generatorVersion() {
@@ -95,33 +162,18 @@ std::uint32_t generatorVersion() {
     std::uint32_t bits = 0;
     std::memcpy(&bits, &kTerrainBase, sizeof bits);
     const std::uint32_t parts[] = {
-        kTerrainSeed, bits, kLavaBand, kDirtBand, kGeneratorVersion,
+        kTerrainSeed, bits, kGeneratorVersion,
         kStoneId, kDirtId, kGrassId, kSandId, kLavaId,
+        // The reference world the shape scales from is part of the generated
+        // world too: changing it moves every surface, and a save written
+        // against one reference must not be replayed against another.
+        kRefSizeX, kRefSizeZ,
     };
     for (const std::uint32_t part : parts) {
         version ^= part;
         version *= 0x01000193u;   // FNV-1a
     }
     return version;
-}
-
-std::uint32_t terrainTop(std::int32_t x, std::int32_t y, std::int32_t maxZ) {
-    std::int32_t top = static_cast<std::int32_t>(std::floor(terrainHeight(x, y))) + 1;
-    top = std::clamp(top, 1, std::max(1, maxZ));
-    return static_cast<std::uint32_t>(top);
-}
-
-std::uint16_t terrainMaterial(std::int32_t x, std::int32_t y, std::int32_t z,
-                             std::uint32_t top) {
-    (void)x;
-    (void)y;
-    const auto zi = static_cast<std::int32_t>(z);
-    const auto ti = static_cast<std::int32_t>(top);
-    if (zi >= ti) return 0;
-    if (zi < static_cast<std::int32_t>(kLavaBand)) return kLavaId;
-    if (zi == ti - 1) return top < 54 ? kSandId : kGrassId;
-    if (zi + static_cast<std::int32_t>(kDirtBand) >= ti) return kDirtId;
-    return kStoneId;
 }
 
 const std::vector<Material>& serverMaterials() {
@@ -204,8 +256,8 @@ World::World(WorldSpec spec, std::uint64_t seed)
     : World(spec, seed, nullptr) {}
 
 World::World(WorldSpec spec, std::uint64_t seed, RegionStore* store)
-    : m_spec(spec), m_seed(seed), m_store(store),
-      m_bricks(spec.rootCount(), Brick(brickLodLevel(spec.brick))) {
+    : m_spec(spec), m_shape(terrainShape(spec.sizeX, spec.sizeZ)), m_seed(seed),
+      m_store(store), m_bricks(spec.rootCount()) {
     if (m_spec.brick == 0 || (m_spec.brick & (m_spec.brick - 1)) != 0)
         throw std::invalid_argument("WorldSpec::brick must be a power of two");
     if (m_spec.sizeX == 0 || m_spec.sizeY == 0 || m_spec.sizeZ == 0)
@@ -244,31 +296,38 @@ std::uint32_t World::rootIndexAround(float x, float y, float z) const {
                 static_cast<std::uint32_t>(m_spec.rootDimY()) * static_cast<std::uint32_t>(bz));
 }
 
+Brick& World::brickAt(std::uint32_t rootIndex) {
+    std::unique_ptr<Brick>& slot = m_bricks[rootIndex];
+    if (!slot) slot = std::make_unique<Brick>(brickLodLevel(m_spec.brick));
+    return *slot;
+}
+
 Brick& World::ensure(std::uint32_t rootIndex) {
-    Brick& brick = m_bricks[rootIndex];
+    Brick& brick = brickAt(rootIndex);
     if (!brick.generated()) generate(rootIndex);
     return brick;
 }
 
 void World::generate(std::uint32_t rootIndex) {
+    Brick& brick = brickAt(rootIndex);
     // Regenerating into a brick that already holds a tree would interleave the
     // new walk's blocks with the old one's freed ones, because both use the
     // same allocator and the same indices. Starting from an empty brick keeps
     // "this brick equals generate(index) plus its delta" true by construction.
-    m_bricks[rootIndex].reset();
-    buildProcedural(rootIndex, m_bricks[rootIndex]);
+    brick.reset();
+    buildProcedural(rootIndex, brick);
     // Overlay the player's edits. This is the whole point of the provenance
     // tree: the procedural walk is a pure function of the seed, and the delta
     // is everything that makes this brick different from it.
     if (m_store != nullptr) {
         if (ProvenanceTree* delta = m_store->deltaFor(rootIndex)) {
-            delta->applyTo(m_bricks[rootIndex]);
+            delta->applyTo(brick);
         }
     }
     // A freshly generated brick carries the world revision it was built from,
     // so an edit anywhere bumps exactly the bricks that changed.
-    m_bricks[rootIndex].setRevision(m_revision);
-    m_bricks[rootIndex].markGenerated();
+    brick.setRevision(m_revision);
+    brick.markGenerated();
 }
 
 void World::buildProcedural(std::uint32_t rootIndex, Brick& brick) const {
@@ -294,6 +353,69 @@ void World::buildProcedural(std::uint32_t rootIndex, Brick& brick) const {
     }
     std::vector<std::uint16_t> low(total, 0);
     std::vector<std::uint16_t> high(total, 0);
+
+    // Sampling the surface at full brick resolution costs 16,384 noise
+    // evaluations -- three octaves each -- and that is paid for every brick,
+    // including the overwhelming majority that hold nothing interesting. At
+    // this world size there are 16.7 million bricks, and a player standing
+    // still has 64 of them in their column alone, so the whole walk is
+    // dominated by bricks whose answer is "empty" or "solid" and cost a full
+    // column scan to discover.
+    //
+    // So: take the surface height on a coarse lattice first. The terrain is
+    // three octaves of value noise whose coarsest feature is 16 cells, so on a
+    // 16-cell lattice it is very nearly linear between samples, and a
+    // min/max over the lattice bounds the true surface tightly enough to
+    // settle whole bricks without touching every column. Only a brick the
+    // lattice says straddles the surface pays for the fine pass, and those
+    // are the ones that actually contain terrain.
+    //
+    // This is what makes generation affordable at this size, and it is exact
+    // rather than approximate for every brick it settles: a lattice bound that
+    // clears the brick's z range proves the brick is uniform, and the fine
+    // pass reproduces the original per-column result for the rest.
+    constexpr std::uint32_t kLatticeStep = 16;
+    const std::uint32_t latticeEdge =
+        (edge + kLatticeStep - 1) / kLatticeStep + 1;
+    std::uint32_t surfaceMin = 0xFFFFFFFFu;
+    std::uint32_t surfaceMax = 0;
+    for (std::uint32_t ly = 0; ly <= edge; ly += kLatticeStep)
+        for (std::uint32_t lx = 0; lx <= edge; lx += kLatticeStep) {
+            // Clamped to the brick so the lattice covers its corners: sampling
+            // past the edge would bound a region the brick does not contain and
+            // could settle a brick that is in fact mixed.
+            const std::uint32_t sx = std::min(lx, edge - 1);
+            const std::uint32_t sy = std::min(ly, edge - 1);
+            const std::uint32_t worldTop = terrainTop(
+                static_cast<std::int32_t>(originX + sx),
+                static_cast<std::int32_t>(originY + sy), maxZ, m_shape);
+            const std::uint32_t top =
+                worldTop > originZ ? worldTop - originZ : 0u;
+            surfaceMin = std::min(surfaceMin, top);
+            surfaceMax = std::max(surfaceMax, top);
+        }
+
+    // A brick-relative column top `t` means the column is solid for [0, t).
+    // So `t >= edge` on every column is a brick that is solid throughout, and
+    // `t == 0` on every column is one that is empty throughout.
+    //
+    // Only the empty case settles to a single leaf outright. The solid one is
+    // not uniform in general: the material is a function of depth below the
+    // *column top*, so the lava band at the world floor and the dirt band just
+    // under the surface can both fall inside an otherwise all-stone brick. It
+    // is only safe once the brick is far enough below the surface that the dirt
+    // band is above it and above the lava band entirely.
+    if (surfaceMax == 0) {
+        brick.writeLeaf(0, 0, 0);
+        return;
+    }
+    if (surfaceMin >= edge + m_shape.dirtBand &&
+        originZ >= m_shape.lavaBand) {
+        brick.writeLeaf(0, kStoneId, kSvoFlagSolid);
+        return;
+    }
+
+    (void)latticeEdge;
     for (std::uint32_t ly = 0; ly < edge; ++ly)
         for (std::uint32_t lx = 0; lx < edge; ++lx) {
             // Brick-relative exclusive column top. Subtracting originZ from a
@@ -301,13 +423,14 @@ void World::buildProcedural(std::uint32_t rootIndex, Brick& brick) const {
             // columns are simply empty here, which is what top == 0 encodes.
             const std::uint32_t worldTop =
                 terrainTop(static_cast<std::int32_t>(originX + lx),
-                           static_cast<std::int32_t>(originY + ly), maxZ);
+                           static_cast<std::int32_t>(originY + ly), maxZ,
+                           m_shape);
             const std::uint32_t top =
                 worldTop > originZ ? worldTop - originZ : 0u;
             const std::uint16_t clamped = static_cast<std::uint16_t>(
                     std::min(top, edge));
-                low[offset[0] + lx * edge + ly] = clamped;
-                high[offset[0] + lx * edge + ly] = clamped;
+            low[offset[0] + lx * edge + ly] = clamped;
+            high[offset[0] + lx * edge + ly] = clamped;
         }
     for (std::uint32_t level = 1; level <= lod; ++level) {
         const std::uint32_t w = width[level];
@@ -379,19 +502,19 @@ void World::buildProcedural(std::uint32_t rootIndex, Brick& brick) const {
         const std::int32_t worldZ = static_cast<std::int32_t>(originZ) +
                                     static_cast<std::int32_t>(current.z);
         const std::int32_t worldTop = worldZ + static_cast<std::int32_t>(size);
-        const auto lavaBand = static_cast<std::int32_t>(kLavaBand);
+        const auto lavaBand = static_cast<std::int32_t>(m_shape.lavaBand);
         const bool homogeneous = current.low == current.high;
         if (current.z >= current.high) {
             uniform = true;   // strictly above every column top
         } else if (homogeneous) {
             const auto cx = static_cast<std::int32_t>(originX + current.x);
             const auto cy = static_cast<std::int32_t>(originY + current.y);
-            const std::uint32_t columnTop =
-                terrainTop(cx, cy, static_cast<std::uint32_t>(m_spec.sizeZ));
+            const std::uint32_t columnTop = terrainTop(
+                cx, cy, static_cast<std::int32_t>(m_spec.sizeZ), m_shape);
             const std::uint16_t bottom =
-                terrainMaterial(cx, cy, worldZ, columnTop);
+                terrainMaterial(cx, cy, worldZ, columnTop, m_shape);
             const std::uint16_t ceiling =
-                terrainMaterial(cx, cy, worldTop - 1, columnTop);
+                terrainMaterial(cx, cy, worldTop - 1, columnTop, m_shape);
             if (bottom == ceiling) {
                 uniform = true;
                 material = bottom;
@@ -407,8 +530,9 @@ void World::buildProcedural(std::uint32_t rootIndex, Brick& brick) const {
             const std::int32_t wx = static_cast<std::int32_t>(originX + current.x);
             const std::int32_t wy = static_cast<std::int32_t>(originY + current.y);
             const std::int32_t wz = static_cast<std::int32_t>(originZ + current.z);
-            const std::uint32_t columnTop = terrainTop(wx, wy, maxZ);
-            const std::uint16_t atCell = terrainMaterial(wx, wy, wz, columnTop);
+            const std::uint32_t columnTop = terrainTop(wx, wy, maxZ, m_shape);
+            const std::uint16_t atCell =
+                terrainMaterial(wx, wy, wz, columnTop, m_shape);
             brick.writeLeaf(current.node, atCell,
                             atCell == 0 ? 0 : kSvoFlagSolid);
             continue;
@@ -526,8 +650,11 @@ void World::fill(std::int32_t minX, std::int32_t minY, std::int32_t minZ,
 
 void World::snapshot(std::uint32_t rootIndex, std::uint32_t& revision,
                      SvoNode& rootNode, std::vector<SvoNode>& nodes) {
-    revision = ensure(rootIndex).revision();
-    m_bricks[rootIndex].compact(nodes, rootNode);
+    // One lookup, not two: ensure() is the only way to reach a brick, and calling
+    // it twice would be a second hash-free-but-still-cache-missing index.
+    Brick& brick = ensure(rootIndex);
+    revision = brick.revision();
+    brick.compact(nodes, rootNode);
 }
 
 void World::snapshotLod(std::uint32_t rootIndex, std::uint8_t leafLevel,
@@ -549,6 +676,208 @@ void World::snapshotLod(std::uint32_t rootIndex, std::uint8_t leafLevel,
 
 std::uint32_t World::brickRevision(std::uint32_t rootIndex) {
     return ensure(rootIndex).revision();
+}
+
+namespace {
+
+// Scratch for the level-0 -> level-1 pass: a running colour sum and a count of
+// how many level-0 cells each slot stands for, so a leaf that covers eight
+// whole cells and a single stray cell contribute in the right proportion.
+struct Accum {
+    std::uint32_t dim = 0;
+    // Cells covered, and how many of those were solid. These are not the same
+    // number: a fully covered level-1 cell always covers 8 of them, whatever
+    // they contain, so using coverage as alpha makes every cell opaque and
+    // distant sky come out solid.
+    std::vector<std::uint32_t> count;
+    std::vector<std::uint32_t> solid;
+    std::vector<AvgCell> sum;
+
+    std::size_t index(std::uint32_t x, std::uint32_t y, std::uint32_t z) const {
+        return (static_cast<std::size_t>(z) * dim + y) * dim + x;
+    }
+};
+
+// The colour a material id contributes to an average. Air contributes nothing
+// and leaves the cell empty, so `sum` only ever accumulates solid colour and
+// `solid` is the right divisor.
+AvgCell colourFor(std::uint16_t material) {
+    AvgCell cell;
+    if (material == 0) return cell;          // empty
+    const std::vector<Material>& table = serverMaterials();
+    if (material >= table.size()) return cell;
+    const Material& m = table[material];
+    cell.r = static_cast<std::uint8_t>(m.r * 255.0f + 0.5f);
+    cell.g = static_cast<std::uint8_t>(m.g * 255.0f + 0.5f);
+    cell.b = static_cast<std::uint8_t>(m.b * 255.0f + 0.5f);
+    cell.empty = false;
+    return cell;
+}
+
+// Level 1 rule: any solid child at all makes the cell carry colour.
+AvgCell normalise(const AvgCell& sum, std::uint32_t solid) {
+    AvgCell cell;
+    if (solid == 0) return cell;
+    cell.r = static_cast<std::uint8_t>(sum.r / solid);
+    cell.g = static_cast<std::uint8_t>(sum.g / solid);
+    cell.b = static_cast<std::uint8_t>(sum.b / solid);
+    cell.empty = false;
+    return cell;
+}
+
+// Splats one leaf of the level-0 tree into the level-1 accumulator.
+//
+// A leaf of edge `size` at (x, y, z) is entirely one material, so it
+// contributes that colour to every level-1 cell it overlaps, weighted by how
+// many level-0 cells that overlap covers. Because `size` and `x` are both
+// multiples of two for every leaf above the finest, a leaf never straddles a
+// level-1 cell boundary except at its edge, and the covered range is exactly
+// `size / 2` cells on each axis.
+void splatInto(Accum& accum, std::uint32_t x, std::uint32_t y, std::uint32_t z,
+               std::uint32_t size, const AvgCell& colour, bool isSolid) {
+    if (size == 1) {
+        // A single cell is one eighth of a level-1 cell. Weight 1 lets the
+        // accumulator normalise by covered volume at the end, rather than
+        // special-casing alignment here.
+        const std::size_t at = accum.index(x / 2, y / 2, z / 2);
+        accum.count[at] += 1;
+        if (isSolid) accum.solid[at] += 1;
+        accum.sum[at].r += colour.r;
+        accum.sum[at].g += colour.g;
+        accum.sum[at].b += colour.b;
+        return;
+    }
+    for (std::uint32_t gz = z / 2; gz < (z + size) / 2; ++gz)
+        for (std::uint32_t gy = y / 2; gy < (y + size) / 2; ++gy)
+            for (std::uint32_t gx = x / 2; gx < (x + size) / 2; ++gx) {
+                const std::size_t at = accum.index(gx, gy, gz);
+                accum.count[at] += 8;
+                if (isSolid) accum.solid[at] += 8;
+                accum.sum[at].r += colour.r * 8;
+                accum.sum[at].g += colour.g * 8;
+                accum.sum[at].b += colour.b * 8;
+            }
+}
+
+// Walks the packed tree, handing every leaf to `visit`.
+template <typename Visit>
+void forEachLeaf(const Octree& tree, Visit&& visit) {
+    struct Frame {
+        std::uint32_t index;
+        std::uint32_t x, y, z, level;
+    };
+    std::vector<Frame> stack{
+        {0, 0, 0, 0, tree.lodLevel()}};
+    while (!stack.empty()) {
+        const Frame f = stack.back();
+        stack.pop_back();
+        const SvoNode& node = tree.node(f.index);
+        if (!node.hasChildren()) {
+            visit(f.x, f.y, f.z, 1u << f.level, node);
+            continue;
+        }
+        const std::uint32_t half = 1u << (f.level - 1);
+        for (std::uint32_t k = 0; k < 8; ++k) {
+            if ((node.mask & (1u << k)) == 0u) continue;
+            stack.push_back({node.firstChild() + k,
+                             f.x + ((k & 1u) ? half : 0u),
+                             f.y + ((k & 2u) ? half : 0u),
+                             f.z + ((k & 4u) ? half : 0u),
+                             f.level - 1});
+        }
+    }
+}
+
+} // namespace
+
+void World::snapshotPyramid(std::uint32_t rootIndex, BrickPyramid& out) {
+    Brick& brick = ensure(rootIndex);
+    out.revision = brick.revision();
+    for (auto& level : out.level) level.clear();
+    out.uniform = false;
+    out.uniformCell = AvgCell{};
+
+    // Level 0 first, unchanged from what the old path streamed.
+    out.level0.clear();
+    brick.compact(out.level0, out.rootNode);
+
+    const std::uint8_t topLevel = static_cast<std::uint8_t>(brickLodLevel(m_spec.brick));
+    const std::uint32_t edge = 1u << topLevel;
+
+    // A brick that is a single leaf is already its own average at every level:
+    // there is nothing to average, and all eight levels are the same cell.
+    // This is the case for every brick of open sky and deep rock.
+    if (out.level0.size() == 1) {
+        const SvoNode& only = out.rootNode;
+        out.uniform = true;
+        out.uniformCell = colourFor(only.solid() ? only.material : 0);
+        out.level[topLevel] = {out.uniformCell};
+        return;
+    }
+
+    // Level 1: accumulate every level-0 leaf into the 2x2x2 cells it covers,
+    // weighted by the number of level-0 cells each contribution stands for.
+    const std::uint32_t dim = edge / 2;
+    Accum accum;
+    accum.dim = dim;
+    accum.count.assign(static_cast<std::size_t>(dim) * dim * dim, 0);
+    accum.solid.assign(static_cast<std::size_t>(dim) * dim * dim, 0);
+    accum.sum.assign(static_cast<std::size_t>(dim) * dim * dim, AvgCell{});
+    forEachLeaf(brick, [&](std::uint32_t x, std::uint32_t y, std::uint32_t z,
+                          std::uint32_t size, const SvoNode& node) {
+        // Air contributes no colour, but it does contribute to the coverage
+        // count, so a partly-air cell averages to a partly transparent colour
+        // rather than to whatever solid happened to be nearby.
+        const AvgCell colour = colourFor(node.solid() ? node.material : 0);
+        splatInto(accum, x, y, z, size, colour, node.solid());
+    });
+    out.level[1].resize(accum.count.size());
+    for (std::size_t i = 0; i < accum.count.size(); ++i)
+        out.level[1][i] = normalise(accum.sum[i], accum.solid[i]);
+
+    // Levels 2..n: halve on each axis. Every cell now has eight children by
+    // construction, so this is exact and cannot refuse.
+    for (std::uint8_t k = 2; k < kLodLevels; ++k) {
+        const std::vector<AvgCell>& finer = out.level[k - 1];
+        const std::uint32_t fdim = edge >> (k - 1);
+        std::vector<AvgCell>& coarser = out.level[k];
+        coarser.assign(static_cast<std::size_t>(fdim / 2) * (fdim / 2) *
+                           (fdim / 2),
+                       AvgCell{});
+        for (std::uint32_t z = 0; z < fdim / 2; ++z)
+            for (std::uint32_t y = 0; y < fdim / 2; ++y)
+                for (std::uint32_t x = 0; x < fdim / 2; ++x) {
+                    // Average the eight children in straight RGBA. This is
+                    // deliberately not weighted by alpha: each child covers the
+                    // same volume, so each is one eighth of the parent, and the
+                    // parent's own alpha already carries "how much of me was
+                    // solid" from the level-1 pass.
+                    std::uint32_t r = 0, g = 0, b = 0, solidChildren = 0;
+                    for (std::uint32_t dz = 0; dz < 2; ++dz)
+                        for (std::uint32_t dy = 0; dy < 2; ++dy)
+                            for (std::uint32_t dx = 0; dx < 2; ++dx) {
+                                const AvgCell& c =
+                                    finer[(z * 2 + dz) * fdim * fdim +
+                                          (y * 2 + dy) * fdim + (x * 2 + dx)];
+                                if (c.empty) continue;   // air casts no vote
+                                ++solidChildren;
+                                r += c.r;
+                                g += c.g;
+                                b += c.b;
+                            }
+                    // Two of eight. One solid child is not enough to hold a
+                    // cell open, which is what keeps a coarse level free of the
+                    // speckle a one-child threshold would produce.
+                    AvgCell cell;
+                    if (solidChildren >= 2) {
+                        cell.r = static_cast<std::uint8_t>(r / solidChildren);
+                        cell.g = static_cast<std::uint8_t>(g / solidChildren);
+                        cell.b = static_cast<std::uint8_t>(b / solidChildren);
+                        cell.empty = false;
+                    }
+                    coarser[(z * (fdim / 2) + y) * (fdim / 2) + x] = cell;
+                }
+    }
 }
 
 void World::generateAll() {

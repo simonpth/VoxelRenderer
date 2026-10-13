@@ -131,6 +131,7 @@ if(VOXEL_ENABLE_TRACY)
 endif()
 
 set(COMPUTE_SLANG_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/compute.slang")
+set(COMPUTE_SLANG_DEPS "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/svo.slang")
 set(FULLSCREEN_SLANG_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/fullscreen.slang")
 set(OVERLAY_SLANG_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/overlay.slang")
 set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
@@ -162,7 +163,7 @@ if(VOXEL_ENABLE_SLANG)
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUTPUT_DIR}"
 		COMMAND "${SLANGC_EXECUTABLE}" -target spirv -profile spirv_1_3
 			-entry computeMain -stage compute -o "${COMPUTE_SHADER}" "${COMPUTE_SLANG_SOURCE}"
-		DEPENDS "${COMPUTE_SLANG_SOURCE}"
+		DEPENDS "${COMPUTE_SLANG_SOURCE}" "${COMPUTE_SLANG_DEPS}"
 		VERBATIM
 	)
 	add_custom_command(
@@ -343,6 +344,63 @@ if(VOXEL_BUILD_TESTS)
 	)
 	target_link_libraries(VoxelLifecycleTests PRIVATE glm::glm)
 	add_test(NAME VoxelLifecycleTests COMMAND VoxelLifecycleTests)
+
+	# End to end at the production world size (65536 x 65536 x 8192), where the
+	# root layer is 16,777,216 entries and the server generates lazily.
+	add_executable(VoxelBigWorldTests
+		tests/bigworld_test.cpp
+		src/network/client.cpp
+		src/network/server.cpp
+		src/network/protocol.cpp
+		src/network/tcp_socket.cpp
+		src/network/udp_socket.cpp
+		src/simulation/authority.cpp
+		${VOXEL_SIM_SOURCES}
+	)
+	target_include_directories(VoxelBigWorldTests PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/src"
+	)
+	target_link_libraries(VoxelBigWorldTests PRIVATE glm::glm)
+	add_test(NAME VoxelBigWorldTests COMMAND VoxelBigWorldTests)
+
+	# The LOD pyramid: each level exactly 1/8 the one below, uniform bricks
+	# unchanged, and averages taken over level-0 geometry rather than guessed.
+	add_executable(VoxelLodPyramidTests
+		tests/lod_pyramid_test.cpp
+		${VOXEL_SIM_SOURCES}
+	)
+	target_include_directories(VoxelLodPyramidTests PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/src"
+	)
+	target_link_libraries(VoxelLodPyramidTests PRIVATE glm::glm)
+	add_test(NAME VoxelLodPyramidTests COMMAND VoxelLodPyramidTests)
+
+	# Token bucket pacing, directly: deterministic, no sockets, no terrain.
+	add_executable(VoxelPacerTests
+		tests/pacer_test.cpp
+	)
+	target_include_directories(VoxelPacerTests PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/src"
+	)
+	add_test(NAME VoxelPacerTests COMMAND VoxelPacerTests)
+
+	# Bricks must arrive finest detail first: the offered ring sequence is
+	# non-decreasing, which is what "high quality before low quality" means.
+	add_executable(VoxelStreamOrderTests
+		tests/stream_order_test.cpp
+		src/network/client.cpp
+		src/network/server.cpp
+		src/network/protocol.cpp
+		src/network/tcp_socket.cpp
+		src/network/udp_socket.cpp
+		src/simulation/authority.cpp
+		${VOXEL_SIM_SOURCES}
+	)
+	target_include_directories(VoxelStreamOrderTests PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/src"
+	)
+	target_link_libraries(VoxelStreamOrderTests PRIVATE glm::glm)
+	add_test(NAME VoxelStreamOrderTests COMMAND VoxelStreamOrderTests)
 
 	# Pins the streaming delivery contract: no acknowledgement before upload, no
 	# silent drop when the queue is full, retry on silence, and redelivery after

@@ -154,7 +154,9 @@ int main() {
                      x < static_cast<std::int32_t>(spec.sizeX); ++x) {
                     const std::uint16_t expected = terrainMaterial(
                         x, y, z,
-                        terrainTop(x, y, static_cast<std::int32_t>(spec.sizeZ)));
+                        terrainTop(x, y, static_cast<std::int32_t>(spec.sizeZ),
+                                   world.shape()),
+                        world.shape());
                     const std::uint16_t actual = world.get(x, y, z);
                     ++checked;
                     if (actual == expected) continue;
@@ -183,7 +185,9 @@ int main() {
                            (x >= 0 && y >= 0 && z >= 0 && x < 64 && y < 96 &&
                                     z < 32
                                 ? terrainMaterial(x, y, z,
-                                                  terrainTop(x, y, 32))
+                                                  terrainTop(x, y, 32,
+                                                             world.shape()),
+                                                  world.shape())
                                 : 0));
         // Below the world floor is solid, above the ceiling is empty.
         assert(world.isSolid(0, 0, -1));

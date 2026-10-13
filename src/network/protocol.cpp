@@ -66,6 +66,11 @@ bool f32(std::span<const std::byte> in, std::size_t& at, float& value) {
     std::memcpy(&value, &bits, sizeof value);
     return std::isfinite(value);
 }
+bool u8(std::span<const std::byte> in, std::size_t& at, std::uint8_t& value) {
+    if (at >= in.size()) return false;
+    value = std::to_integer<std::uint8_t>(in[at++]);
+    return true;
+}
 bool read(std::span<const std::byte> in, std::size_t& at, void* out,
           std::size_t size) {
     if (in.size() - at < size) return false;
@@ -207,6 +212,7 @@ std::vector<std::byte> encode(const WorldAck& message) {
     u32(out, message.playerId);
     u32(out, message.rootIndex);
     u32(out, message.revision);
+    out.push_back(std::byte(message.lodLevel));
     return out;
 }
 
@@ -220,7 +226,27 @@ std::vector<std::byte> encode(const WorldForget& message) {
 }
 
 std::vector<std::byte> encode(const BrickSnapshot& message) {
-    if (message.nodes.empty() || message.nodes.size() > kMaxBrickNodes) return {};
+    if (message.nodes.size() > kMaxBrickNodes) return {};
+    // Exactly one payload, and it must be the one `lodLevel` names. A frame with
+    // both an octree and a grid is a bug on the sender's side, and encoding it
+    // anyway would leave the receiver deciding which to believe. A frame with
+    // neither is nothing to send: the receiver rejects it as corrupt, so
+    // sending it would only burn bandwidth on a brick that stays missing.
+    if (message.nodes.empty() == message.levels.empty()) return {};
+    if (!message.levels.empty() && !message.nodes.empty()) return {};
+    if (message.levels.size() > voxel::kLodLevels) return {};
+    for (const BrickLevel& level : message.levels) {
+        if (level.cells.empty() || level.cells.size() > kMaxLevelCells)
+            return {};
+        // edge^3 must describe exactly the grid sent, so a corrupt edge cannot
+        // be mistaken for a valid allocation size. edge == 0 is the documented
+        // single-colour case and holds exactly one cell.
+        if (level.edge == 0) {
+            if (level.cells.size() != 1) return {};
+        } else if (static_cast<std::uint64_t>(level.edge) * level.edge *
+                       level.edge != level.cells.size())
+            return {};
+    }
     std::vector<std::byte> out;
     header(out, PacketKind::BrickSnapshot);
     uuid(out, message.uuid);
@@ -230,7 +256,20 @@ std::vector<std::byte> encode(const BrickSnapshot& message) {
     u32(out, message.worldRevision);
     out.push_back(std::byte(message.lodLevel));
     u32(out, static_cast<std::uint32_t>(message.nodes.size()));
-    bytes(out, message.nodes.data(), message.nodes.size() * sizeof(SvoNode));
+    if (!message.nodes.empty())
+        bytes(out, message.nodes.data(), message.nodes.size() * sizeof(SvoNode));
+    u32(out, static_cast<std::uint32_t>(message.levels.size()));
+    for (const BrickLevel& level : message.levels) {
+        out.push_back(std::byte(level.level));
+        u32(out, level.edge);
+        u32(out, static_cast<std::uint32_t>(level.cells.size()));
+        for (const AvgCell& cell : level.cells) {
+            out.push_back(std::byte(cell.r));
+            out.push_back(std::byte(cell.g));
+            out.push_back(std::byte(cell.b));
+            out.push_back(std::byte(cell.empty ? 0 : 1));
+        }
+    }
     return out;
 }
 
@@ -340,10 +379,14 @@ bool decode(std::span<const std::byte> in, WorldInterest& message) {
 
 bool decode(std::span<const std::byte> in, WorldAck& message) {
     std::size_t at = 0;
+    // The level is the last byte and must be present: an ack without one is a
+    // v4 peer's, which says nothing about which level of a multi-level brick
+    // arrived, so accepting it would book it against level 0 and leave the
+    // coarse level permanently unacknowledged.
     return begin(in, at, PacketKind::WorldAck) &&
            uuid(in, at, message.uuid) && u32(in, at, message.playerId) &&
            u32(in, at, message.rootIndex) && u32(in, at, message.revision) &&
-           at == in.size();
+           u8(in, at, message.lodLevel) && at == in.size();
 }
 
 bool decode(std::span<const std::byte> in, WorldForget& message) {
@@ -363,30 +406,70 @@ bool decode(std::span<const std::byte> in, BrickSnapshot& message) {
         return false;
     message.lodLevel = std::to_integer<std::uint8_t>(in[at++]);
     if (message.lodLevel > 31) return false;
-    if (!u32(in, at, count) || count == 0 || count > kMaxBrickNodes) return false;
-    if (static_cast<std::size_t>(count) * sizeof(SvoNode) != in.size() - at)
+    message.nodes.clear();
+    message.levels.clear();
+    if (!u32(in, at, count) || count > kMaxBrickNodes) return false;
+    // An exact-size payload is checked before anything is trusted with it, so a
+    // truncated frame cannot be read into a buffer sized from its own length.
+    if (static_cast<std::size_t>(count) * sizeof(SvoNode) > in.size() - at)
         return false;
     message.nodes.resize(count);
-    if (!read(in, at, message.nodes.data(), count * sizeof(SvoNode)))
+    if (count != 0 && !read(in, at, message.nodes.data(),
+                            count * sizeof(SvoNode)))
         return false;
-    if (at != in.size()) return false;
 
-    // The root lives at index 0, so every child index must land inside the
-    // payload, and a node with children needs room for all of them.
-    for (const SvoNode& node : message.nodes) {
-        if (!node.hasChildren()) continue;
-        const std::uint32_t first = node.firstChild();
-        if (first == 0 || first >= count) return false;
-        // Children are contiguous and stored in mask order, so the highest
-        // stored child sits at first + popcount(mask) - 1.
-        if (first + static_cast<std::uint32_t>(
-                        std::popcount(static_cast<std::uint8_t>(node.mask))) >
-            count)
+    if (!u32(in, at, count) || count > voxel::kLodLevels) return false;
+    message.levels.resize(count);
+    for (BrickLevel& level : message.levels) {
+        if (at >= in.size()) return false;
+        level.level = std::to_integer<std::uint8_t>(in[at++]);
+        std::uint32_t edge = 0;
+        std::uint32_t cells = 0;
+        if (!u32(in, at, edge) || !u32(in, at, cells)) return false;
+        if (cells == 0 || cells > kMaxLevelCells) return false;
+        // edge == 0 is the single-colour case and must hold exactly one cell.
+        // Checked against the declared edge rather than assumed, so a frame
+        // that promises a grid and sends one byte is a corrupt frame.
+        if (edge == 0) {
+            if (cells != 1) return false;
+        } else if (static_cast<std::uint64_t>(edge) * edge * edge != cells)
+            return false;
+        if (static_cast<std::size_t>(cells) * 4 > in.size() - at) return false;
+        level.edge = edge;
+        level.cells.resize(cells);
+        for (AvgCell& cell : level.cells) {
+            cell.r = std::to_integer<std::uint8_t>(in[at++]);
+            cell.g = std::to_integer<std::uint8_t>(in[at++]);
+            cell.b = std::to_integer<std::uint8_t>(in[at++]);
+            cell.empty = std::to_integer<std::uint8_t>(in[at++]) == 0;
+        }
+    }
+    if (at != in.size()) return false;
+    // A frame must carry a payload. One with neither is a heartbeat from a peer
+    // that has nothing to say about this brick, and telling it apart from a
+    // corrupt frame matters: the former is legitimate, the latter must not
+    // reach the client's bookkeeping.
+    if (message.nodes.empty() && message.levels.empty()) return false;
+    if (!message.nodes.empty() && !message.levels.empty()) return false;
+
+    if (!message.nodes.empty()) {
+        // The root lives at index 0, so every child index must land inside the
+        // payload, and a node with children needs room for all of them.
+        for (const SvoNode& node : message.nodes) {
+            if (!node.hasChildren()) continue;
+            const std::uint32_t first = node.firstChild();
+            if (first == 0 || first >= message.nodes.size()) return false;
+            // Children are contiguous and stored in mask order, so the highest
+            // stored child sits at first + popcount(mask) - 1.
+            if (first + static_cast<std::uint32_t>(std::popcount(
+                            static_cast<std::uint8_t>(node.mask))) >
+                message.nodes.size())
+                return false;
+        }
+        if (!message.nodes.front().hasChildren() &&
+            message.nodes.front().firstChild() != 0)
             return false;
     }
-    if (!message.nodes.front().hasChildren() &&
-        message.nodes.front().firstChild() != 0)
-        return false;
     return true;
 }
 

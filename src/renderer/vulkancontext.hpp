@@ -25,9 +25,11 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <glm/glm.hpp>
@@ -111,7 +113,18 @@ class VulkanContext {
         float tanHalfFovX = 0.7f;
         float tanHalfFovY = 0.7f;
         glm::vec4 sunDirection{0.0f, 0.0f, 1.0f, 0.0f};
+        // Interest window in brick coordinates, kept in step with the shader's
+        // PushConstants. The shader needs it to tell a brick it was promised
+        // from one it never heard of; only the former is "missing" data.
+        // Kept last so the struct's size lands on 128 bytes, the minimum every
+        // Vulkan implementation must support for push constants.
+        uint32_t interestX = 0;
+        uint32_t interestY = 0;
+        uint32_t interestZ = 0;
+        uint32_t interestRadius = 0;
     };
+    static_assert(sizeof(ComputePushConstants) == 128,
+                  "push constants must stay within the 128-byte floor");
 
     struct FrameData {
         VkCommandPool   pool                    = VK_NULL_HANDLE;
@@ -144,6 +157,25 @@ class VulkanContext {
     void createComputeImages();
     void destroyComputeImages();
     void writeWorldDescriptors();
+    struct GridLevel;
+    // Takes one averaged pyramid level into the grid store. Returns whether it
+    // was accepted, which is what decides whether the client may acknowledge
+    // the level: a grid that does not describe itself consistently is a corrupt
+    // frame and has to stay unacknowledged so the server resends it.
+    bool acceptGrid(voxel::BrickUpdate& update, voxel::RenderState& state);
+    // Mirrors one accepted grid into the GPU pool and tags the root entry, so
+    // the shader can find it. Bump-allocates; evicted levels leave holes (see
+    // m_gridPool). Returns false when the pool cannot take it even grown --
+    // which leaves the level host-held but unacknowledged, so the server
+    // retries it rather than the client confirming data the GPU cannot sample.
+    bool uploadGrid(std::uint32_t rootIndex, std::uint8_t level,
+                    const GridLevel& grid, std::size_t& rootFirst,
+                    std::size_t& rootLast, std::size_t& gridFirst,
+                    std::size_t& gridLast);
+    // Doubles the grid pool preserving contents. Offsets are stable across a
+    // grow -- the arena only ever extends at its end -- so no root entry moves
+    // and no base offset has to be rewritten.
+    void resizeGridPool(std::size_t needUints);
     void createWorldBuffers(std::uint32_t poolNodes);
     void destroyWorldBuffers();
     // Reallocates the node arena to a larger capacity, preserving contents and
@@ -201,8 +233,23 @@ class VulkanContext {
     VkFormat m_computeImageFormat = VK_FORMAT_R8G8B8A8_UNORM;
 
     // --- SVO GPU storage ---
-    // Root table: one uint2 per root-layer brick, holding that brick's root
-    // node plus a resident flag. Direct index, no search.
+    // Root table: one uint4 per root-layer brick.
+    //
+    //   x, y   the brick's octree root node, exactly as before. Existing reads
+    //          of .xy keep working; the widening only appends.
+    //   z      resident level mask plus per-level edges. Bit L (0..7) is set
+    //          when pyramid level L is on the GPU; bit 0 mirrors the
+    //          kSvoFlagResident flag in x so the shader has one word to test
+    //          for "anything usable". Bits 8+3*(L-1)..10+3*(L-1) hold log2 of
+    //          the grid edge for levels 1..7 (0 means a single cell, which is
+    //          both a real 1-edge grid and the wire fast path -- the two are
+    //          the same size on the GPU, so the shader never distinguishes).
+    //   w      grid pool base offset in uints, or 0xFFFFFFFF when the brick
+    //          holds no grids. Grids for one brick sit consecutively in level
+    //          order; the shader sums the sizes of the resident finer levels
+    //          to reach a level, which is at most seven adds.
+    //
+    // Direct index, no search.
     voxel::MappedBuffer m_rootTable{};
     std::size_t m_rootTableCapacity = 0;
 
@@ -241,6 +288,74 @@ class VulkanContext {
     // Whether the "arena full" warning has been printed. Once, not once a
     // frame: a persistent shortfall is visible from this and should not scroll.
     bool m_warnedPoolFull = false;
+
+    // --- Pyramid levels 1 and above ---------------------------------------
+    //
+    // The averaged grids live here rather than in the node pool, because they
+    // are a different shape of data: a pool slot is an octree block the ray
+    // traversal walks, and a grid is a flat array of colours it indexes. Mixing
+    // them would either waste the node pool's block alignment or make the
+    // traversal ask which kind of thing it is looking at.
+    //
+    // Two copies, deliberately. m_grids is the host record the client
+    // acknowledges against; m_gridPool is the GPU mirror the shader samples.
+    // The host copy has to stay -- it is what re-uploads after a pool grow --
+    // and at ~120 MB for a whole world of top-level grids plus the window's
+    // finer ones it fits both budgets it sits beside.
+    // Keyed as in Client::levelKey() and Server::levelKey(): rootIndex << 3 |
+    // level. Same packing, because it is what the arrival is reported under and
+    // the client has to match it to its own record.
+    static std::uint64_t gridKey(std::uint32_t rootIndex,
+                                 std::uint8_t level) noexcept {
+        return (static_cast<std::uint64_t>(rootIndex) << 3) |
+               static_cast<std::uint64_t>(level);
+    }
+    // One AvgCell packed the way the shader unpacks it: R in bits 24..31, G in
+    // 16..23, B in 8..15, solid flag in bit 0. Packing lives next to the
+    // mirror it feeds (svo.slang documents the same layout) so the two cannot
+    // drift: change one and the other's unpack reads garbage.
+    static std::uint32_t packCell(const voxel::AvgCell& cell) noexcept {
+        return (static_cast<std::uint32_t>(cell.r) << 24) |
+               (static_cast<std::uint32_t>(cell.g) << 16) |
+               (static_cast<std::uint32_t>(cell.b) << 8) |
+               (cell.solid() ? 1u : 0u);
+    }
+    struct GridLevel {
+        // Cells per side, or 0 for the single-colour fast path. Zero is worth
+        // keeping as written rather than expanded on arrival: expanding level 1
+        // of a uniform brick would cost a megabyte to say one thing.
+        std::uint32_t edge = 0;
+        std::vector<voxel::AvgCell> cells;
+    };
+    std::unordered_map<std::uint64_t, GridLevel> m_grids;
+    // Bytes held across m_grids. The budget binds on this, not on the entry
+    // count: a level-1 grid is a megabyte and a top-level one is four bytes,
+    // so a count would either starve the fine levels or hoard the coarse ones.
+    std::size_t m_gridBytes = 0;
+    // Whole-world top-level grids are ~67 MB and the window's finer ones tens
+    // of MB beside that; 256 MB holds both with headroom for churn. Host and
+    // GPU mirrors each hold one copy, so the pair costs twice this at most.
+    static constexpr std::size_t kGridByteBudget = 256u << 20;
+    // Oldest-first order, so eviction can retire the least recently arrived
+    // instead of guessing. The grids are already in the map; this is only the
+    // ordering.
+    std::deque<std::uint64_t> m_gridArrival;
+    // GPU mirror of m_grids: flat packed cells, bump-allocated. Grown, never
+    // compacted: an evicted level leaves a hole, because compaction would move
+    // every base offset the root table names. Holes are bounded by churn, and
+    // the host budget bounds the live bytes, so the pool stays within ~2x of
+    // the budget in the worst case.
+    voxel::MappedBuffer m_gridPool{};
+    std::size_t m_gridPoolCapacity = 0;   // in uints
+    std::size_t m_gridPoolUsed = 0;       // in uints, high-water bump mark
+    // Per-brick allocation record: base offset plus bytes already placed for
+    // this brick, so a later level appends after the earlier ones without a
+    // scan. Keyed by root index, not by level: one brick, one record.
+    struct GridAlloc {
+        std::uint32_t base = 0xFFFFFFFFu;
+        std::uint32_t used = 0;
+    };
+    std::unordered_map<std::uint32_t, GridAlloc> m_gridAlloc;
 
     bool m_framebufferResized = false;
 

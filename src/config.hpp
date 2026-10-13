@@ -20,7 +20,15 @@ namespace voxel {
 struct Config {
     std::uint16_t serverPort = 27015;
     std::string serverHost = "127.0.0.1";
-    WorldSpec world{1024, 1024, 256, 128};
+    // 2^16 x 2^16 x 2^13 cells. With 128-cell bricks that is a 512 x 512 x 64
+    // root layer, or 16,777,216 bricks.
+    //
+    // The world is procedural and the terrain is a heightfield, so the server
+    // stores none of it: any brick is regenerated from the seed on demand.
+    // That is what makes this size reachable -- full-resolution storage would
+    // be 4.4 TiB against an 8 GiB budget, and even a single-node-per-brick
+    // floor would need 128 MiB just for root entries.
+    WorldSpec world{65536, 65536, 8192, 128};
     std::uint64_t seed = 0xC0FFEE1234ULL;
     std::uint8_t interestRadius = 6;
 
@@ -46,7 +54,7 @@ struct Config {
     // finds out.
     std::uint64_t serverWorldBytes = 8ull * 1024 * 1024 * 1024;
 
-    std::uint32_t maxRayDistance = 2048;
+    std::uint32_t maxRayDistance = 131072;
     // Set when a negotiation flag is malformed; reported at startup.
     bool helpRequested = false;
     bool parseError = false;

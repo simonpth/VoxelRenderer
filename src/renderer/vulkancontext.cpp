@@ -2,6 +2,8 @@
 #define VMA_IMPLEMENTATION
 #include "vulkancontext.hpp"
 
+#include "../simulation/svo.hpp"
+
 #include <algorithm>
 #include <cstring>
 #include <fstream>
@@ -229,7 +231,7 @@ void VulkanContext::createWorldBuffers(std::uint32_t poolNodes) {
   // capacity is the real memory budget.
   voxel::createMappedBuffer(m_allocator, 4096, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                      m_rootTable);
-  m_rootTableCapacity = static_cast<std::size_t>(m_rootTable.size) / sizeof(uint32_t) / 2;
+  m_rootTableCapacity = static_cast<std::size_t>(m_rootTable.size) / sizeof(uint32_t) / 4;
 
   createMappedBuffer(
       m_allocator,
@@ -243,9 +245,19 @@ void VulkanContext::createWorldBuffers(std::uint32_t poolNodes) {
       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, m_materials);
   m_materialCapacity = voxel::kMaterialCount;
 
+  // The grid pool starts at 64 MB and doubles on demand (see resizeGridPool).
+  // A whole world of top-level grids is ~67 MB, so the first fill pass will
+  // grow it once and then it settles; starting at the full budget would pin
+  // 256 MB of host-visible memory most sessions never touch.
+  createMappedBuffer(m_allocator, static_cast<VkDeviceSize>(64u << 20),
+                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, m_gridPool);
+  m_gridPoolCapacity = static_cast<std::size_t>(m_gridPool.size) / sizeof(uint32_t);
+  m_gridPoolUsed = 0;
+
   std::memset(m_rootTable.mapped, 0, m_rootTable.size);
   std::memset(m_nodePool.mapped, 0, m_nodePool.size);
   std::memset(m_materials.mapped, 0, m_materials.size);
+  std::memset(m_gridPool.mapped, 0, m_gridPool.size);
 
   // The arena starts empty and at the budget it was given. Growing later is a
   // rare, deliberate act for a single brick bigger than the whole arena; it is
@@ -265,9 +277,16 @@ void VulkanContext::destroyWorldBuffers() {
   voxel::destroyMappedBuffer(m_allocator, m_rootTable);
   voxel::destroyMappedBuffer(m_allocator, m_nodePool);
   voxel::destroyMappedBuffer(m_allocator, m_materials);
+  voxel::destroyMappedBuffer(m_allocator, m_gridPool);
   m_rootTableCapacity = 0;
   m_nodePoolCapacity = 0;
   m_materialCapacity = 0;
+  m_gridPoolCapacity = 0;
+  m_gridPoolUsed = 0;
+  m_grids.clear();
+  m_gridAlloc.clear();
+  m_gridArrival.clear();
+  m_gridBytes = 0;
   m_pool.clear();
   m_poolUsed = 0;
   m_residentBricks = 0;
@@ -363,18 +382,20 @@ void VulkanContext::createFrameResources() {
 }
 
 void VulkanContext::createDescriptorSetLayout() {
-  // Fixed bindings, no descriptor indexing: the root table and node pool are
-  // separate buffers and the shader indexes them with plain offsets.
-  VkDescriptorSetLayoutBinding bindings[5]{};
+  // Fixed bindings, no descriptor indexing: the root table, node pool,
+  // material table and grid pool are separate buffers and the shader indexes
+  // them with plain offsets.
+  VkDescriptorSetLayoutBinding bindings[6]{};
   bindings[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
   bindings[1] = {1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
   bindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
   bindings[3] = {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
   bindings[4] = {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+  bindings[5] = {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 
   VkDescriptorSetLayoutCreateInfo setInfo{};
   setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  setInfo.bindingCount = 5;
+  setInfo.bindingCount = 6;
   setInfo.pBindings = bindings;
   checkVk(vkCreateDescriptorSetLayout(m_device, &setInfo, nullptr,
                                       &m_descriptorSetLayout),
@@ -537,7 +558,7 @@ void VulkanContext::createDescriptorPool() {
   VkDescriptorPoolSize poolSizes[] = {
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kFramesInFlight},
       {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kFramesInFlight},
-      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kFramesInFlight * 3},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kFramesInFlight * 4},
   };
 
   VkDescriptorPoolCreateInfo poolInfo{};
@@ -563,27 +584,28 @@ void VulkanContext::createDescriptorPool() {
     m_frames[i].computeDescriptorSet = descriptorSets[i];
 }
 
-// Rewrites the three SVO storage-buffer bindings on every frame set. Called
+// Rewrites the four world storage-buffer bindings on every frame set. Called
 // after any world buffer is created, destroyed, or grown.
 void VulkanContext::writeWorldDescriptors() {
   if (m_rootTable.buffer == VK_NULL_HANDLE || m_frames[0].computeDescriptorSet == VK_NULL_HANDLE)
     return;
-  VkDescriptorBufferInfo infos[3] = {
+  VkDescriptorBufferInfo infos[4] = {
       {m_rootTable.buffer, 0, m_rootTable.size},
       {m_nodePool.buffer, 0, m_nodePool.size},
       {m_materials.buffer, 0, m_materials.size},
+      {m_gridPool.buffer, 0, m_gridPool.size},
   };
   for (std::uint32_t i = 0; i < kFramesInFlight; ++i) {
-    VkWriteDescriptorSet writes[3]{};
+    VkWriteDescriptorSet writes[4]{};
     for (auto &write : writes) write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    for (int binding = 0; binding < 3; ++binding) {
+    for (int binding = 0; binding < 4; ++binding) {
       writes[binding].dstSet = m_frames[i].computeDescriptorSet;
       writes[binding].dstBinding = static_cast<std::uint32_t>(binding + 2);
       writes[binding].descriptorCount = 1;
       writes[binding].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
       writes[binding].pBufferInfo = &infos[binding];
     }
-    vkUpdateDescriptorSets(m_device, 3, writes, 0, nullptr);
+    vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
   }
 }
 
@@ -661,20 +683,189 @@ void VulkanContext::destroyComputeImages() {
 
 // --- CPU -> GPU world upload ----------------------------------------------
 
-void VulkanContext::uploadWorld(voxel::RenderState &state) {
+// Takes one averaged pyramid level into the grid store, and reports it as held
+// so the client can acknowledge it.
+//
+// The edge is validated against the cell count rather than assumed, because the
+// single-colour fast path (edge == 0, one cell) and a real grid are otherwise
+// indistinguishable by size alone once a coarse level has as few cells. A frame
+// that promises a grid and sends one cell is corrupt, and returning false here
+// leaves the level unacknowledged so the server resends it.
+bool VulkanContext::acceptGrid(voxel::BrickUpdate& update,
+                               voxel::RenderState& state) {
+  const std::size_t edges = update.cells.size();
+  const std::uint64_t cells = static_cast<std::uint64_t>(edges);
+  // edge == 0 is documented as exactly one cell; anything else must satisfy
+  // edge^3 == cells. Derived here is the edge the level names, not one the
+  // sender chose, so a mismatched grid cannot be silently resized into shape.
+  const std::uint32_t declared = update.edge;
+  const std::uint64_t volume =
+      declared == 0 ? 1ull : static_cast<std::uint64_t>(declared) * declared *
+                                 declared;
+  if (volume != cells) return false;
+
+  const std::uint64_t key = gridKey(update.rootIndex, update.lodLevel);
+  const auto held = m_grids.find(key);
+  if (held == m_grids.end()) {
+    m_gridArrival.push_back(key);
+    m_gridBytes += cells * sizeof(uint32_t);
+  } else {
+    // Same level resent (a newer revision, or a retry): the bytes were already
+    // counted, so only the payload is replaced. Refreshing the arrival order
+    // here would let a hot brick pin itself; eviction is oldest-arrival, not
+    // least-recently-used, on purpose.
+    m_gridBytes -= held->second.cells.size() * sizeof(uint32_t);
+    m_gridBytes += cells * sizeof(uint32_t);
+  }
+  m_grids[key] = GridLevel{declared, update.cells};
+
+  // Evict oldest first, bounded by bytes (see m_gridBytes): a level-1 grid is
+  // a megabyte and a top-level one four bytes, so a count would either starve
+  // the fine levels or hoard the coarse ones. Evicted levels are reported
+  // rather than silently dropped: the client has to stop considering them
+  // held, or the next resend is dismissed as a duplicate and the level is
+  // missing for the rest of the session.
+  //
+  // The GPU mask bit goes with the host entry, in the same breath. The pool
+  // never reuses holes, so a stale bit would name intact-but-evicted data --
+  // and worse, a re-uploaded level would alias the old hole instead of the new
+  // copy, because the offset sums skip only cleared bits. Clearing is what
+  // keeps "bit set" meaning "the data at the computed offset is this level".
+  auto* rootTable = static_cast<uint32_t*>(m_rootTable.mapped);
+  while (m_gridBytes > kGridByteBudget && !m_gridArrival.empty()) {
+    const std::uint64_t oldest = m_gridArrival.front();
+    m_gridArrival.pop_front();
+    const auto dropped = m_grids.find(oldest);
+    if (dropped == m_grids.end()) continue;
+    m_gridBytes -= dropped->second.cells.size() * sizeof(uint32_t);
+    m_grids.erase(dropped);
+    const auto rootIndex = static_cast<std::uint32_t>(oldest >> 3);
+    const auto level = static_cast<std::uint8_t>(oldest & 0x7u);
+    if (rootIndex < m_rootTableCapacity && level >= 1 && level <= 7) {
+      const std::size_t header = static_cast<std::size_t>(rootIndex) * 4;
+      rootTable[header + 2] &=
+          ~((1u << level) | (0x7u << (8 + 3 * (level - 1))));
+      // rootFirst/rootLast are the caller's; the eviction is reported through
+      // state either way, and the flush span is extended by the upload below
+      // for the common case. A frame that only evicts flushes the word here.
+      flushSpan(m_allocator, m_rootTable.allocation, m_rootTable.size,
+                static_cast<VkDeviceSize>((header + 2) * sizeof(uint32_t)),
+                static_cast<VkDeviceSize>((header + 4) * sizeof(uint32_t)),
+                m_flushAlignment);
+    }
+    state.evictedRefs.push_back({rootIndex, level});
+  }
+  return true;
+}
+
+void VulkanContext::resizeGridPool(std::size_t needUints) {
+  std::size_t target =
+      std::max<std::size_t>(m_gridPoolCapacity == 0 ? 1u << 24 : m_gridPoolCapacity * 2,
+                            needUints);
+  voxel::MappedBuffer replacement{};
+  voxel::createMappedBuffer(m_allocator,
+                            static_cast<VkDeviceSize>(target) * sizeof(uint32_t),
+                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, replacement);
+  if (m_gridPool.mapped != nullptr && m_gridPoolUsed > 0)
+    std::memcpy(replacement.mapped, m_gridPool.mapped,
+                m_gridPoolUsed * sizeof(uint32_t));
+  voxel::destroyMappedBuffer(m_allocator, m_gridPool);
+  m_gridPool = replacement;
+  m_gridPoolCapacity = target;
+  writeWorldDescriptors();
+  std::cout << "Vulkan: grid pool grown to "
+            << (static_cast<std::uint64_t>(target) * sizeof(uint32_t)) << " bytes\n";
+}
+
+// Log2 of a grid edge, or 0 for the single-cell fast path. The shader stores
+// the same 3-bit value per level in the root entry and derives the size from
+// it, so this is the one place the encoding is decided: change it here and the
+// shader reads a different size for the same level.
+static std::uint32_t gridEdgeLog(std::uint32_t edge) {
+  if (edge <= 1) return 0;
+  std::uint32_t log = 0;
+  while ((1u << (log + 1)) <= edge) ++log;
+  return log & 0x7u;
+}
+
+bool VulkanContext::uploadGrid(std::uint32_t rootIndex, std::uint8_t level,
+                               const GridLevel& grid, std::size_t& rootFirst,
+                               std::size_t& rootLast, std::size_t& gridFirst,
+                               std::size_t& gridLast) {
+  const std::size_t cells = grid.cells.size();
+  if (cells == 0 || cells > m_gridPoolCapacity) {
+    // Larger than the pool could ever be is a corrupt frame wearing a valid
+    // shape: acceptGrid validated edge^3, but a 1 GB grid would still pass
+    // that and then eat the arena. Refuse it here so it stays unacknowledged.
+    if (cells > m_gridPoolCapacity && m_gridPoolCapacity >= (kGridByteBudget / 4))
+      return false;
+  }
+  if (m_gridPoolUsed + cells > m_gridPoolCapacity)
+    resizeGridPool(m_gridPoolUsed + cells);
+  if (m_gridPoolUsed + cells > m_gridPoolCapacity) return false;
+
+  GridAlloc& alloc = m_gridAlloc[rootIndex];
+  if (alloc.base == 0xFFFFFFFFu) {
+    alloc.base = static_cast<std::uint32_t>(m_gridPoolUsed);
+    alloc.used = 0;
+  }
+  auto* pool = static_cast<uint32_t*>(m_gridPool.mapped);
+  // Worst case this upload relocates the brick's whole run before appending,
+  // so capacity is ensured for that before anything moves.
+  while (m_gridPoolUsed + alloc.used + cells > m_gridPoolCapacity)
+    resizeGridPool(m_gridPoolUsed + alloc.used + cells);
+  if (m_gridPoolUsed + alloc.used + cells > m_gridPoolCapacity) return false;
+  if (static_cast<std::size_t>(alloc.base) + alloc.used != m_gridPoolUsed) {
+    // Another brick placed after this one's run, so appending in place would
+    // overwrite it. Relocate the run to the mark and continue there; the root
+    // entry names the base, which is rewritten below, so no other record
+    // moves. Levels for one brick arrive seconds apart and runs are
+    // kilobytes, which is what makes a copy cheaper than a free list.
+    if (alloc.used > 0) {
+      std::memmove(pool + m_gridPoolUsed, pool + alloc.base,
+                   alloc.used * sizeof(uint32_t));
+      gridFirst = std::min(gridFirst, m_gridPoolUsed);
+      gridLast = std::max(gridLast, m_gridPoolUsed + alloc.used - 1);
+    }
+    alloc.base = static_cast<std::uint32_t>(m_gridPoolUsed);
+    m_gridPoolUsed += alloc.used;
+  }
+  const std::size_t dest = m_gridPoolUsed;
+  for (std::size_t i = 0; i < cells; ++i)
+    pool[dest + i] = packCell(grid.cells[i]);
+  alloc.used += static_cast<std::uint32_t>(cells);
+  if (dest + cells > m_gridPoolUsed) m_gridPoolUsed = dest + cells;
+  gridFirst = std::min(gridFirst, dest);
+  gridLast = std::max(gridLast, dest + cells - 1);
+
+  // Tag the root entry: mask bit plus edge log, base on first grid. The mask
+  // is ORed, never rewritten, so a concurrent level for the same brick cannot
+  // clear a bit this upload just set -- uploads run on one thread, but the
+  // read-modify-write still states the invariant.
+  auto* rootTable = static_cast<uint32_t*>(m_rootTable.mapped);
+  const std::size_t header = static_cast<std::size_t>(rootIndex) * 4;
+  rootTable[header + 2] |= (1u << level) |
+                           (gridEdgeLog(grid.edge) << (8 + 3 * (level - 1)));
+  rootTable[header + 3] = alloc.base;
+  rootFirst = std::min(rootFirst, header + 2);
+  rootLast = std::max(rootLast, header + 3);
+  return true;
+}
+
+void VulkanContext::uploadWorld(voxel::RenderState& state) {
   if (state.sizeX == 0 || state.brick == 0 || state.rootCount == 0) return;
 
-  // The root table is one uint2 per root-layer brick. It is only ever grown,
+  // The root table is one uint4 per root-layer brick. It is only ever grown,
   // so a swapchain recreation never has to reallocate anything.
   if (state.rootCount > m_rootTableCapacity) {
     const VkDeviceSize bytes = std::max<VkDeviceSize>(
-        static_cast<VkDeviceSize>(state.rootCount) * sizeof(uint32_t) * 2,
+        static_cast<VkDeviceSize>(state.rootCount) * sizeof(uint32_t) * 4,
         m_rootTable.size * 2);
     voxel::destroyMappedBuffer(m_allocator, m_rootTable);
     voxel::createMappedBuffer(m_allocator, bytes,
                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, m_rootTable);
     m_rootTableCapacity =
-        static_cast<std::size_t>(m_rootTable.size) / (2 * sizeof(uint32_t));
+        static_cast<std::size_t>(m_rootTable.size) / (4 * sizeof(uint32_t));
     std::memset(m_rootTable.mapped, 0, m_rootTable.size);
     writeWorldDescriptors();
   }
@@ -736,10 +927,12 @@ void VulkanContext::uploadWorld(voxel::RenderState &state) {
   std::size_t rootLast = 0;
   std::size_t poolFirst = m_nodePoolCapacity;
   std::size_t poolLast = 0;
+  std::size_t gridFirst = m_gridPoolCapacity;
+  std::size_t gridLast = 0;
 
-  state.uploadedRoots.clear();
-  state.processedRoots.clear();
-  state.evictedRoots.clear();
+  state.uploadedRefs.clear();
+  state.processedRefs.clear();
+  state.evictedRefs.clear();
   for (voxel::BrickUpdate &update : state.bricks) {
     // Every brick handed over is reported as processed, whatever the outcome.
     // That is what lets the client tell "still queued" from "handed over and
@@ -751,7 +944,11 @@ void VulkanContext::uploadWorld(voxel::RenderState &state) {
     // `uploaded` is cleared first, so every path below that bails out leaves
     // the brick unacknowledged and therefore eligible for a retry.
     update.uploaded = false;
-    state.processedRoots.push_back(update.rootIndex);
+    // Reported per (root, level), so the client can acknowledge the levels that
+    // arrived without acknowledging one that did not. A brick is not a thing
+    // that arrives; a level of a brick is.
+    const voxel::BrickRef ref{update.rootIndex, update.lodLevel};
+    state.processedRefs.push_back(ref);
     if (update.rootIndex >= m_rootTableCapacity) continue;
 
     if (update.remove) {
@@ -760,11 +957,46 @@ void VulkanContext::uploadWorld(voxel::RenderState &state) {
         m_residentBricks = static_cast<std::uint32_t>(m_pool.size());
         m_poolUsed = m_pool.used();
         const std::size_t header =
-            static_cast<std::size_t>(update.rootIndex) * 2;
+            static_cast<std::size_t>(update.rootIndex) * 4;
         rootTable[header + 0] = 0;
         rootTable[header + 1] = 0;
+        rootTable[header + 2] = 0;
+        rootTable[header + 3] = 0xFFFFFFFFu;
         rootFirst = std::min(rootFirst, header);
-        rootLast = std::max(rootLast, header + 1);
+        rootLast = std::max(rootLast, header + 3);
+        // A removed brick is gone at every level, not just level 0: its grids
+        // would otherwise linger in the host store and on the GPU, and the
+        // client would keep acknowledging resends of data the renderer
+        // dropped. Nothing is reported -- removal is already the client's
+        // record going away, which is what makes the next send a fresh
+        // delivery rather than a duplicate.
+        for (std::uint8_t level = 1; level < voxel::kLodLevels; ++level) {
+          const auto it = m_grids.find(gridKey(update.rootIndex, level));
+          if (it != m_grids.end()) {
+            // The bytes go back with the entry: the budget counts live data,
+            // and a removed brick holds none. Forgetting this leaks the budget
+            // upward until everything newly arriving is evicted on arrival.
+            m_gridBytes -= it->second.cells.size() * sizeof(uint32_t);
+            m_grids.erase(it);
+          }
+        }
+        m_gridAlloc.erase(update.rootIndex);
+      }
+      continue;
+    }
+    if (update.lodLevel != 0) {
+      // An averaged grid for this level. It goes into its own store rather than
+      // into the node pool, because the two have different shapes: a pool slot
+      // is octree blocks the traversal walks, and this is a flat array of
+      // colours it indexes. Acknowledged only once it is on the GPU, not
+      // merely host-held: the client must never confirm data the shader cannot
+      // sample.
+      if (acceptGrid(update, state) &&
+          uploadGrid(update.rootIndex, update.lodLevel,
+                     m_grids[gridKey(update.rootIndex, update.lodLevel)],
+                     rootFirst, rootLast, gridFirst, gridLast)) {
+        update.uploaded = true;
+        state.uploadedRefs.push_back(ref);
       }
       continue;
     }
@@ -793,12 +1025,18 @@ void VulkanContext::uploadWorld(voxel::RenderState &state) {
       // its next pass and the claim is tried again from a different arena
       // state.
       for (const std::uint32_t evicted : claim.evicted) {
-        const std::size_t header = static_cast<std::size_t>(evicted) * 2;
+        // Only level 0 goes: the pool holds octrees, and the evicted brick's
+        // coarse grids stay right where they are -- the far field keeps its
+        // data while the detail brick waits for a retry. Clearing the whole
+        // entry would throw away levels the client acknowledged and the
+        // server will not resend unasked.
+        const std::size_t header = static_cast<std::size_t>(evicted) * 4;
         rootTable[header + 0] = 0;
         rootTable[header + 1] = 0;
+        rootTable[header + 2] &= ~1u;
         rootFirst = std::min(rootFirst, header);
-        rootLast = std::max(rootLast, header + 1);
-        state.evictedRoots.push_back(evicted);
+        rootLast = std::max(rootLast, header + 2);
+        state.evictedRefs.push_back({evicted, 0});
       }
       m_evictedBricks += claim.evicted.size();
       if (!m_warnedPoolFull) {
@@ -817,12 +1055,14 @@ void VulkanContext::uploadWorld(voxel::RenderState &state) {
     // server has to be told to forget them, or their next resend is dismissed
     // as a duplicate and the terrain is missing for the rest of the session.
     for (const std::uint32_t evicted : claim.evicted) {
-      const std::size_t header = static_cast<std::size_t>(evicted) * 2;
+      // Level 0 only; coarse grids survive (see above).
+      const std::size_t header = static_cast<std::size_t>(evicted) * 4;
       rootTable[header + 0] = 0;
       rootTable[header + 1] = 0;
+      rootTable[header + 2] &= ~1u;
       rootFirst = std::min(rootFirst, header);
-      rootLast = std::max(rootLast, header + 1);
-      state.evictedRoots.push_back(evicted);
+      rootLast = std::max(rootLast, header + 2);
+      state.evictedRefs.push_back({evicted, 0});
     }
     m_evictedBricks += claim.evicted.size();
     m_residentBricks = static_cast<std::uint32_t>(m_pool.size());
@@ -843,20 +1083,24 @@ void VulkanContext::uploadWorld(voxel::RenderState &state) {
     poolLast = std::max(poolLast, destination + needed * 2);
 
     const voxel::SvoNode &root = update.nodes.front();
-    const std::size_t header = static_cast<std::size_t>(update.rootIndex) * 2;
+    const std::size_t header = static_cast<std::size_t>(update.rootIndex) * 4;
     rootTable[header + 0] =
         (root.word0 & 0x00FFFFFFu) |
         (static_cast<std::uint32_t>(root.flags() | voxel::kSvoFlagResident) << 24);
     rootTable[header + 1] = root.word1();
+    // Bit 0 mirrors the resident flag so the shader tests one word for
+    // "anything usable" instead of two. ORed, not written: a brick whose
+    // coarse levels arrived first keeps their bits.
+    rootTable[header + 2] |= 1u;
     rootFirst = std::min(rootFirst, header);
-    rootLast = std::max(rootLast, header + 1);
+    rootLast = std::max(rootLast, header + 2);
 
     // Only now is the brick genuinely in the pool, and only now may the client
     // tell the server so. Acknowledging earlier -- on receipt, or before the
     // pool is known to have room -- is what let bricks end up permanently
     // undelivered while the server believed them sent.
     update.uploaded = true;
-    state.uploadedRoots.push_back(update.rootIndex);
+    state.uploadedRefs.push_back(ref);
   }
 
   if (rootLast >= rootFirst)
@@ -868,6 +1112,11 @@ void VulkanContext::uploadWorld(voxel::RenderState &state) {
     flushSpan(m_allocator, m_nodePool.allocation, m_nodePool.size,
               static_cast<VkDeviceSize>(poolFirst * sizeof(uint32_t)),
               static_cast<VkDeviceSize>((poolLast + 1) * sizeof(uint32_t)),
+              m_flushAlignment);
+  if (gridLast >= gridFirst)
+    flushSpan(m_allocator, m_gridPool.allocation, m_gridPool.size,
+              static_cast<VkDeviceSize>(gridFirst * sizeof(uint32_t)),
+              static_cast<VkDeviceSize>((gridLast + 1) * sizeof(uint32_t)),
               m_flushAlignment);
 
   state.bricks.clear();
@@ -1006,6 +1255,30 @@ void VulkanContext::recordCommands(FrameData &frame, uint32_t imageIndex,
   pushConstants.tanHalfFovX = std::tan(glm::radians(35.0f));
   pushConstants.tanHalfFovY = pushConstants.tanHalfFovX;
   pushConstants.sunDirection = glm::vec4(m_sunDirection, 0.0f);
+  // Window in brick coordinates, matching what uploadWorld gave the arena.
+  // Sent unconditionally rather than only when non-zero: a zero radius means
+  // "no window promised", which is the correct reading before the descriptor
+  // arrives, and it must not leave stale window data from a previous frame.
+  {
+    const std::int32_t brick = static_cast<std::int32_t>(state.brick);
+    const std::int32_t dimX = static_cast<std::int32_t>(state.rootDimX);
+    const std::int32_t dimY = static_cast<std::int32_t>(state.rootDimY);
+    const std::int32_t dimZ = static_cast<std::int32_t>(state.rootDimZ);
+    const bool usable = brick > 0 && dimX > 0 && dimY > 0 && dimZ > 0;
+    pushConstants.interestX =
+        usable ? static_cast<uint32_t>(std::clamp<std::int32_t>(
+                     state.interestX / brick, 0, dimX - 1))
+               : 0u;
+    pushConstants.interestY =
+        usable ? static_cast<uint32_t>(std::clamp<std::int32_t>(
+                     state.interestY / brick, 0, dimY - 1))
+               : 0u;
+    pushConstants.interestZ =
+        usable ? static_cast<uint32_t>(std::clamp<std::int32_t>(
+                     state.interestZ / brick, 0, dimZ - 1))
+               : 0u;
+    pushConstants.interestRadius = usable ? state.interestRadius : 0u;
+  }
   vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                      sizeof(pushConstants), &pushConstants);
   vkCmdDispatch(cmd, (m_swapchain.extent.width + 7) / 8,

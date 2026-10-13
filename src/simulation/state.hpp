@@ -121,22 +121,47 @@ inline constexpr std::uint16_t kMaterialCount = 6;
 // renderer drains exactly once and then discards.
 // ---------------------------------------------------------------------------
 
+// Which brick, at which level of its pyramid.
+//
+// A brick is resident *at a level*, not as a whole. The visible detail under the
+// player's feet is the exact octree at level 0; the terrain at the horizon is
+// an averaged grid at level 5 or 6. Those are different pieces of data that
+// arrive separately, are evicted separately, and must be acknowledged
+// separately -- keying them on the root index alone would let a level-0
+// delivery be read as covering the coarse one, and the coarse one would then be
+// either never acknowledged or never refined.
+struct BrickRef {
+    std::uint32_t rootIndex = 0;
+    std::uint8_t level = 0;
+};
+
 struct BrickUpdate {
     // Index into the world's N-ary root layer. The renderer addresses the
     // root table directly with it and needs nothing else to place a brick.
     std::uint32_t rootIndex = 0;
     std::uint32_t revision = 0;
-    // Leaf level the server reduced this brick to. A brick's own full
-    // resolution is log2(brick edge), so anything lower is reduced detail and
-    // this is what makes the payload small.
+    // Which level of this brick the payload holds. Level 0 is the exact
+    // octree -- a brick's own full resolution is log2(brick edge) -- so
+    // anything above 0 is an averaged grid and `cells` is the payload.
     std::uint8_t lodLevel = 0;
-    // Transient payload: index 0 is the brick root, the rest its subtree.
+    // Transient payload for level 0: index 0 is the brick root, the rest its
+    // subtree.
+    //
+    // Ownership is transferred, never shared. See Client::drainBricks() for
+    // why this vector must have exactly one owner at a time.
     std::vector<SvoNode> nodes;
+    // Transient payload for levels 1 and above: a regular grid of averaged
+    // colour, `edge` cells per side, x fastest. There is no alpha -- a cell
+    // either has a colour or is empty -- so this needs no blending and no
+    // ordering against the octree below it.
+    //
+    // `edge == 0` is the single-colour case and `cells` holds one cell; see
+    // BrickLevel in protocol.hpp. Carried separately rather than derived from
+    // the cell count, because two different levels can both reduce to a single
+    // cell and the receiver has no way to tell them apart from the size.
+    std::uint32_t edge = 0;
+    std::vector<AvgCell> cells;
     bool remove = false;
-    // Set by the renderer once the brick is genuinely resident in the GPU pool.
-    // The client only acknowledges a brick after seeing this, so "the server
-    // thinks we have it" can never run ahead of "it is actually on the GPU" --
-    // a brick the pool refused must stay unacknowledged so it is retried.
     bool uploaded = false;
 };
 
@@ -157,6 +182,11 @@ struct RenderState {
     std::vector<Material> materials;
 
     PlayerState localPlayer{};
+    // The renderer's upload queue for this frame. Filled by
+    // Client::drainBricks() immediately before the draw and emptied by
+    // VulkanContext::uploadWorld() during it, so it is main-thread only for
+    // its whole lifetime. The world stream never touches this vector; it has
+    // its own, which is what makes the handover a swap rather than a race.
     std::vector<BrickUpdate> bricks;
 
     // The neighbourhood the client wants resident, in world-cell coordinates,
@@ -173,21 +203,23 @@ struct RenderState {
     std::int32_t interestZ = 0;
     std::int32_t interestRadius = 0;
 
-    // Root indices the renderer placed in the GPU pool this frame. Drained and
-    // cleared by the client each frame, and this is the *only* thing that
-    // produces an acknowledgement: a brick that was merely received, or that
-    // the pool refused, never appears here and so stays outstanding.
-    std::vector<std::uint32_t> uploadedRoots;
+    // Bricks the renderer placed in the GPU pool this frame, one entry per
+    // level. Drained and cleared by the client each frame, and this is the
+    // *only* thing that produces an acknowledgement: a brick that was merely
+    // received, or that the pool refused, never appears here and so stays
+    // outstanding.
+    std::vector<BrickRef> uploadedRefs;
 
-    // Every root the renderer finished with this frame, uploaded or not. The
-    // client needs this to tell "still queued" from "handed over and dropped":
-    // a refused brick must leave the client's outstanding set so the server's
-    // next resend is accepted rather than mistaken for a duplicate. Without it,
-    // refusing a brick would wedge it permanently -- the client would wait for
-    // an upload that can never arrive and the server would wait for an ack.
-    std::vector<std::uint32_t> processedRoots;
+    // Every brick level the renderer finished with this frame, uploaded or not.
+    // The client needs this to tell "still queued" from "handed over and
+    // dropped": a refused brick must leave the client's outstanding set so the
+    // server's next resend is accepted rather than mistaken for a duplicate.
+    // Without it, refusing a brick would wedge it permanently -- the client
+    // would wait for an upload that can never arrive and the server would wait
+    // for an ack.
+    std::vector<BrickRef> processedRefs;
 
-    // Roots the renderer dropped from the pool to make room for something
+    // Bricks the renderer dropped from the pool to make room for something
     // else. Filled by the renderer, drained by the client. A brick here was
     // uploaded, acknowledged, and then thrown away, so it is *not* an
     // outstanding upload -- and it is also no longer resident, which is the
@@ -199,7 +231,11 @@ struct RenderState {
     // This is the difference between a bounded arena and a broken one. An
     // eviction the client never learns about is indistinguishable from a brick
     // that never arrived, except that nothing will ever bring it back.
-    std::vector<std::uint32_t> evictedRoots;
+    //
+    // Only level 0 is dropped by name. The coarse levels cost a few hundred
+    // bytes each and the renderer keeps every one of them rather than evicting,
+    // so an eviction with no level on it can only be the detail brick.
+    std::vector<BrickRef> evictedRefs;
 };
 
 } // namespace voxel

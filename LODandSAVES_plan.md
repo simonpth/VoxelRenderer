@@ -1196,4 +1196,216 @@ These are the rules the code is built around. Each has a test.
    either duplicates the world on both sides or lets one side decide the other
    can move.
 
+10. **A scaled world is not a bigger one.** A heightfield generator written in
+   absolute cell counts produces a taller empty world, not a larger one, and
+   tileable noise at an unscaled feature size stamps the same landmass across
+   the whole map. Both are invisible in a small world and structural in a large
+   one. See §20.3.
+
+11. **A wider body exposes what a point never had to be correct about.** The 3x3
+   player found a grounded probe measuring from the wrong end, a spawn height
+   read from one column instead of the footprint, and a clamp that kept only the
+   centre inside the world. See §20.5.
+
+12. **The generator's shortcuts are proofs, not heuristics.** The coarse
+    lattice may settle a brick only when its bound clears the brick's z range;
+    every brick it does not settle comes from the original per-column walk.
+    Checked against 402,653,184 cells of `terrainMaterial()`. See §20.2.
+
+---
+
+## 20. The world at production size: 65536 x 65536 x 8192
+
+### 20.1 What the size forces
+
+The root layer is 512 x 512 x 64 = **16,777,216** bricks. Three numbers decide
+the whole design:
+
+| quantity | value | against the budget |
+|---|---|---|
+| world at full resolution | 4.4 TiB | 8 GiB server RAM |
+| nodes per brick at 8 GiB | 64 | less than one brick root |
+| root table on the GPU | 128 MiB | fits in the 3 GiB arena |
+
+Full-resolution storage is not merely expensive, it is off by five orders of
+magnitude. What makes the size reachable is that **the terrain was already a
+heightfield**: `terrainTop(x, y)` is O(1) and the world is a pure function of the
+seed. So the server stores none of the terrain and regenerates any brick on
+demand. The budget is spent on an index, not on a world.
+
+### 20.2 The generator: a coarse lattice before a fine scan
+
+Sampling the surface at full brick resolution costs 16,384 noise evaluations per
+brick, and it was paid for every brick including the ones whose answer is
+"empty" — measured at 0.22 ms to produce a *single node*.
+
+`buildProcedural` now takes the surface height on a 16-cell lattice first. The
+terrain is three octaves of value noise whose coarsest feature is 16 cells, so
+on that lattice a min/max bounds the true surface tightly enough to settle whole
+bricks without touching every column. Bricks that straddle the surface still pay
+the full scan.
+
+This is exact, not approximate: a lattice bound that clears the brick's z range
+*proves* the brick uniform, and the fine pass reproduces the original per-column
+result for everything else. Verified by brute force at **402,653,184 cells
+against `terrainMaterial()`, zero mismatches**, with all three branches (empty,
+solid, full scan) exercised.
+
+Result: 1.25 ms/brick → **0.082 ms/brick** averaged over the root layer.
+
+### 20.3 The terrain has to scale, or a bigger world is just a taller empty one
+
+Every generator constant was an absolute cell count, which was fine at
+1024 x 1024 x 256 and wrong at 65536 x 65536 x 8192 in two separate ways:
+
+- **Heights.** `kTerrainBase = 46` with relief of 38 puts the surface at 3-33% of
+  a 256-tall world. Unchanged in an 8192-tall one, it leaves 99% empty sky and
+  the player walking on the world floor.
+- **Feature size.** `noiseAt` masks with `& (cell - 1)`, so the terrain repeats
+  *exactly* every `cell` cells. At `cell = 256`, a 65536-wide world is the same
+  256-cell landmass stamped 256 times across.
+
+`TerrainShape` scales both: lateral follows `sizeX`, vertical follows `sizeZ`,
+and the scale is **clamped at 1** so a world no larger than the reference keeps
+the reference landform exactly — every existing small-world test is unchanged
+rather than having its terrain scaled out from under it. The result is the old
+world stretched 64x laterally and 32x vertically:
+
+```
+1024 x 1024 x  256  cells  256/ 64/ 16  surface  53..70 of 256 (21%..27%)
+65536x65536 x 8192  cells 16384/4096/1024  surface 1676..2225 of 8192 (20%..27%)
+```
+
+Relief per 128-cell brick is 8.4 cells against the old world's 9.9, and the
+slope is slightly *steeper* (0.036 vs 0.031 cells/cell). Surface bricks got
+cheaper (0.647 ms / 41.8 KiB against 5.893 ms / 284.5 KiB) because a consistent
+slope summarises into large uniform boxes, not because the terrain went flat.
+
+### 20.4 The root layer is sparse
+
+`std::vector<Brick>` cost 56 bytes per root entry, eagerly, for all 16,777,216
+of them: **896 MB of zeroed memory holding an index**, and 257 ms of
+construction time spent touching every entry. A player standing still walks a
+few thousand bricks of a 16.7 million brick world.
+
+The root layer is now a `unique_ptr<Brick>` per entry — 128 MB of nulls, with a
+brick costing real memory only once something looks at that part of the world.
+Construction: 257 ms → **12 ms**. Every access already funnelled through
+`ensure()`, so the change is eight call sites.
+
+### 20.5 The player is 3 x 3 x 7
+
+Half-extents (1.5, 1.5, 3.5) with z as height, `position` being the centre of
+the box rather than the feet. Widening the box exposed three bugs that a 1-wide
+player had been hiding:
+
+1. **The grounded probe read the centre, not the feet** — a player resting on
+   the floor probed a cell of open air and was never grounded at all.
+2. **Spawn used the centre column's height.** With a 3-wide box, 15 of the 16
+   columns in the footprint stood higher; the player spawned buried, the sweep
+   found every direction blocked, and it could not move at all. It now takes the
+   maximum over the footprint.
+3. **The world clamp kept only the centre inside**, hanging a cell and a half of
+   the player through the boundary.
+
+(1) and (3) were found by the existing tests failing. (2) was not: it surfaced
+as `VoxelDirectionTests` reporting 0.00 blocks travelled at every yaw, which
+reads like a direction bug and is not one.
+
+### 20.6 Test coverage at the production size
+
+`VoxelBigWorldTests` runs the real server and client over loopback at
+65536 x 65536 x 8192, because every other test uses a world where the root
+layer is a rounding error and none of these assumptions fail visibly. It checks
+the descriptor arrives, all 16,777,216 root entries are streamed, the surface is
+above the world floor, and the player spawns on it.
+
+`VoxelStreamAllTests` bounded itself with a fixed 40,000-iteration loop — a
+deadline measured in *this machine's idle speed*. It needed ~7,300 iterations
+unloaded, so under a full ctest run it expired before the world arrived and
+failed for being run alongside other tests. It is now bounded by wall clock,
+with the iteration span still recorded for the pacing assertion.
+
+
+---
+
+## 21. Two bugs that only the production size could show
+
+Both were latent long before 65536 x 65536 x 8192. Neither was in the world, the
+terrain or the LOD -- one was a data race between the receive thread and the
+renderer, the other a disagreement between the streaming window and the view
+distance. Raising the world size is what made both fire.
+
+### 21.1 Heap corruption: two threads mutating one vector
+
+`malloc: *** pointer being freed was not allocated`, aborting in
+`std::vector<SvoNode>::~vector()` under `BrickUpdate::~BrickUpdate()`, reached
+from `VulkanContext::uploadWorld()` at `state.bricks.clear()`.
+
+`Client::enqueueBrick` appended to `m_render.bricks` under `m_mutex`, from the
+world stream thread. `main.cpp` called `renderer.drawFrame(...)` **outside**
+that lock, and `uploadWorld` iterated the same vector and cleared it. Two
+threads, one `std::vector`, torn size/capacity pointers, then a free of whatever
+came out of the registers.
+
+The fix is ownership, not a wider lock. The queue moved into the client as
+`m_pendingBricks` and is handed to the renderer by swap, so each side owns its
+vector outright for as long as it holds it:
+
+- `Client::drainBricks()` swaps the queue out under `m_mutex`.
+- `main.cpp` drains immediately before `drawFrame`.
+- `uploadWorld` clears only what it now exclusively owns.
+
+Holding `m_mutex` across the draw was the alternative, and it is the wrong one:
+the draw does GPU uploads and would serialise the receive thread behind them.
+
+`drainBricks` also **returns what the renderer could not place**. A renderer
+that keeps an unplaced brick queued is retrying it locally; dropping it instead
+leaves it unacknowledged, the server still believes it is in flight, and the
+brick is lost with nothing to bring it back. Caught by `VoxelLruTests`, whose
+fake renderer keeps unplaced bricks queued: throughput fell from ~3000 uploads
+to 242 before that half of the contract was restored.
+
+### 21.2 Purple sky: the window was a third of the view distance
+
+`kUnknownColor` is `(0.55, 0, 0.55)` -- purple -- drawn for any brick whose
+root entry lacks `kSvoFlagResident`. The walk treated *every* such brick as
+missing data.
+
+On a 128-brick world that was honest: a gap was a gap. At 16,777,216 bricks the
+client holds a bounded arena and is never going to hold the root layer, so
+almost every brick a ray reaches is unresident, and "unresident" stopped meaning
+"missing" and started meaning "not mine".
+
+Two things had to change.
+
+**The shader** now asks whether the client ever promised the brick.
+`expectedByClient()` tests the brick against the interest window: inside it a
+non-resident brick is a hole still filling in and is still drawn purple, outside
+it the ray passes through as empty space. An unheld brick is still intersected
+geometrically before being stepped over, so a sky ray crosses it in one move
+rather than a cell at a time and stays inside the 512-iteration cap.
+
+**The window now covers the view distance.** The hard-coded radius of 6 bricks
+was the actual cause: the default ray distance is 2048 cells, which is 16 bricks
+at a 128-cell brick. Ten of every sixteen bricks a sky ray crossed were outside
+the only region the client had asked the server to keep stocked, and so could
+never arrive. The radius now comes from the view distance in `main.cpp`
+(`(maxRayDistance + brick - 1) / brick + 1`, i.e. 17 here) and the client's own
+clamp is against the world geometry rather than a constant. Deriving it rather
+than writing it down is the point: the two numbers had drifted apart silently,
+and nothing in the build would have said so.
+
+Measured: the window streams at ~4,600 bricks/s, acknowledging 225,884 bricks
+in 49 s against a 2,197-brick radius-6 window. Filling the radius-17 window
+takes long enough that the shader fix matters -- without it those seconds are a
+purple sky rather than an empty one.
+
+### 21.3 What is still unverified
+
+The renderer runs in a window and this environment cannot capture it, so the
+colour fix is argued from the shader and the two numbers above, not observed.
+It should be confirmed by eye. What *is* verified: the app runs for 90 s without
+the abort it previously hit 10 s in, and all 13 tests pass.
+
 *End of plan.*
